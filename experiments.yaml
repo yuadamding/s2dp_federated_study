@@ -3,7 +3,7 @@
   description: "Compares the analytic sensitivity bound to the empirical maximum."
   n_subjects: 300
   n_parties: 6
-  repeats: 1
+  repeats: 10
   parameters:
     lambda_regs: [1.0e-7, 1.0e-5, 1.0e-3, 1.0e-1]
     epsilon: 1.0
@@ -14,7 +14,7 @@
   description: "Tests robustness if the public energy bound B is mis-specified."
   n_subjects: 400
   n_parties: 8
-  repeats: 1
+  repeats: 10
   parameters:
     lambda_reg: 1.0e-4
     epsilon: 1.0
@@ -27,7 +27,7 @@
   description: "Tests robustness to basis mis-specification."
   n_subjects: 300
   n_parties: 6
-  repeats: 1
+  repeats: 10
   parameters:
     basis_families: ["bspline", "fourier"]
     lambda_reg: 1.0e-4
@@ -37,9 +37,9 @@
 - exp_id: "scalability"
   enabled: true
   description: "Measures wall-clock runtime and communication cost."
-  repeats: 1
+  repeats: 10
   parameters:
-    n_list: [200, 500, 1000]
+    n_list: [200, 500, 1000, 2000]
     K_list: [4, 8, 16]
     M_list: [20, 50]
     lambda_reg: 1.0e-4
@@ -51,10 +51,10 @@
   description: "Evaluates privacy against Attribute Inference Attacks (AIA)."
   n_subjects: 400
   n_parties: 8
-  repeats: 1
+  repeats: 10
   parameters:
     lambda_reg: 1.0e-5
-    epsilons: [0.5, 2.0, 10.0, .inf] # .inf is non-private
+    epsilons: [0.2, 0.5, 1.0, 2.0, 5.0, 10.0, .inf] # .inf is non-private
     delta: 1.0e-5
 
 - exp_id: "party_dropout"
@@ -62,7 +62,7 @@
   description: "Tests robustness to party drop-out during training."
   n_subjects: 400
   n_parties: 10
-  repeats: 1
+  repeats: 10
   parameters:
     lambda_reg: 1.0e-4
     epsilon: 1.0
@@ -77,10 +77,10 @@
   description: "Compares local DP (S2DP) vs. a central DP baseline."
   n_subjects: 400
   n_parties: 8
-  repeats: 1
+  repeats: 10
   parameters:
     lambda_reg: 1.0e-4
-    epsilons: [0.5, 1.0, 5.0]
+    epsilons: [0.2, 0.5, 1.0, 2.0, 5.0]
     delta: 1.0e-5
 
 - exp_id: "heavy_tailed_error"
@@ -88,7 +88,7 @@
   description: "Checks robustness to non-Gaussian, heavy-tailed errors."
   n_subjects: 300
   n_parties: 8
-  repeats: 1
+  repeats: 10
   parameters:
     error_distribution: "student_t"
     df: 3
