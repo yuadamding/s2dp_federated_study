@@ -37,7 +37,7 @@ install.packages(c("fda", "Matrix", "future.apply"))
 
 ```r
 # in R
-setwd("/Users/yuding/Dropbox/VFL_code")
+setwd("/path/to/your/dir")
 source("generator_vfl.R")
 ```
 
@@ -46,7 +46,7 @@ This writes `yfdobj_*`, `predictorLst_*`, and `truth_active_idx.RData` for each 
 2. **Run experiments in parallel**:
 
 ```r
-setwd("/Users/yuding/Dropbox/VFL_code")
+setwd("/path/to/your/dir")
 source("run_vfl_experiment_parallel.R")
 ```
 
@@ -162,7 +162,7 @@ Public API (all used by the runner):
 Example:
 
 ```r
-setwd("/Users/yuding/Dropbox/VFL_code")
+setwd("/path/to/your/dir")
 file.remove(list.files(pattern = "^(yfdobj|predictorLst)_.*\\.RData$"))
 source("generator_vfl.R")
 source("run_vfl_experiment_parallel.R")
