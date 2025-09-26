@@ -1,8 +1,9 @@
 # ============================================================
 # Parallel runner for DP-corrected VFL functional boosting
-# - Varies number of parties J (vertical split), constant N
-# - Each (replicate x J x fold) is a parallel job
-# - DP-aware selection + CV early stopping
+# - VFL semantics: same individuals across workers; workers own
+#   disjoint subsets of predictors (features).
+# - Jobs = (duplicate x workers x fold). Parallelized with future.apply.
+# - Uses vfl_dp_foboost() with DP-aware selection & CV stopping.
 # ============================================================
 
 root_dir <- "/Users/yuding/Dropbox/VFL_code"
@@ -13,12 +14,13 @@ suppressPackageStartupMessages({
   library(future.apply)
 })
 
-source("functions.R")     # DP FoF + boosting implementation
+source("functions.R")     # DP FoF + boosting
 
 # ---------------------- Settings ----------------------------
-parties_seq       <- c(2, 4, 6, 8, 10)   # number of parties J
+numworkersseq     <- c(2, 4, 6, 8, 10)
 num_duplicate     <- 10
 folds_per_worker  <- 4
+N_global          <- 500
 p                 <- 20
 rangeval          <- c(0, 100)
 t_basis           <- 20
@@ -27,7 +29,8 @@ tgrid             <- seq(rangeval[1], rangeval[2], by = 1)
 
 # DP hyperparameters
 sx_default <- 0.2
-keep_total_privacy <- FALSE   # TRUE => scale per-predictor noise ~ sqrt(J)
+Sx_mode    <- "empirical"   # or "fixed"
+Sx_fixed   <- 3.0
 
 # FoF penalties / boosting controls
 lambda_s <- 5e-2
@@ -44,37 +47,93 @@ min_steps <- 10
 sse_correct_dp <- FALSE
 
 # ---------------------- Helpers -----------------------------
+owner_of_feature <- function(j, numworkers) {
+  ((j - 1) %% numworkers) + 1L
+}
 
 subset_fd <- function(fdobj, idx) {
   stopifnot(is.fd(fdobj))
   co <- fdobj$coefs
   if (is.matrix(co)) {
     fd(coef = co[, idx, drop = FALSE], basisobj = fdobj$basis, fdnames = fdobj$fdnames)
-  } else stop("3D fd$coefs not supported.")
-}
-
-load_replicate <- function(hh) {
-  load(sprintf("yfdobj_%d.RData", hh))        # yfdobj
-  load(sprintf("predictorLst_%d.RData", hh))  # predictorLst (length p)
-  stopifnot(length(predictorLst) == p)
-  list(Y_full = yfdobj, Xlist_full = predictorLst)
-}
-
-assign_to_parties <- function(p, J, mode = c("roundrobin", "contiguous")) {
-  mode <- match.arg(mode)
-  if (mode == "roundrobin") split(1:p, ((0:(p-1)) %% J) + 1) else {
-    cuts <- cut(1:p, breaks = J, labels = FALSE)
-    split(1:p, cuts)
+  } else {
+    stop("3D fd$coefs not supported.")
   }
 }
 
-build_dataset_split <- function(Xlist_full, Y_full, train_idx, test_idx) {
+# VFL-aware per-worker loader: allow NULL for non-owned features
+load_worker_data_nullable <- function(l, numworkers, hh, p_expected) {
+  fy <- sprintf("yfdobj_%d_%d_%d.RData", l, numworkers, hh)
+  fx <- sprintf("predictorLst_%d_%d_%d.RData", l, numworkers, hh)
+  if (!file.exists(fy)) stop(sprintf("[load_worker_data] Missing file: %s", fy))
+  if (!file.exists(fx)) stop(sprintf("[load_worker_data] Missing file: %s", fx))
+  
+  env <- new.env(parent = emptyenv())
+  load(fy, envir = env)
+  load(fx, envir = env)
+  
+  if (!exists("yfdobj", envir = env))
+    stop(sprintf("[load_worker_data] Object 'yfdobj' not found inside %s", fy))
+  if (!exists("predictorLst", envir = env))
+    stop(sprintf("[load_worker_data] Object 'predictorLst' not found inside %s", fx))
+  
+  yfdobj       <- get("yfdobj", envir = env)
+  predictorLst <- get("predictorLst", envir = env)
+  if (!inherits(yfdobj, "fd"))
+    stop(sprintf("[load_worker_data] 'yfdobj' in %s is not an 'fd' object", fy))
+  if (!is.list(predictorLst))
+    stop(sprintf("[load_worker_data] 'predictorLst' in %s is not a list", fx))
+  
+  if (length(predictorLst) != p_expected) {
+    stop(sprintf("[load_worker_data] Length mismatch in %s: length=%d, expected p=%d",
+                 fx, length(predictorLst), p_expected))
+  }
+  # Check owned features only
+  for (j in seq_len(p_expected)) {
+    owns <- (owner_of_feature(j, numworkers) == l)
+    xj <- predictorLst[[j]]
+    if (owns && is.null(xj)) {
+      stop(sprintf("[load_worker_data] Worker %d should own feature %d but it's NULL (k=%d, hh=%d)",
+                   l, j, numworkers, hh))
+    }
+    if (!is.null(xj)) {
+      if (!inherits(xj, "fd"))
+        stop(sprintf("[load_worker_data] predictorLst[[%d]] at worker %d not 'fd'", j, l))
+      # basis / N check
+      if (xj$basis$nbasis != yfdobj$basis$nbasis)
+        stop(sprintf("[load_worker_data] nbasis mismatch j=%d at worker %d", j, l))
+      if (ncol(xj$coefs) != ncol(yfdobj$coefs))
+        stop(sprintf("[load_worker_data] N mismatch j=%d at worker %d", j, l))
+    }
+  }
+  list(yfdobj = yfdobj, predictorLst = predictorLst)
+}
+
+# Build per-predictor global X list by selecting the owning worker's fd;
+# Y is taken from worker 1 (identical across workers by construction).
+build_global_dataset_vfl <- function(numworkers, hh, train_idx, test_idx) {
+  p_expected <- p
+  # load all workers for (k= numworkers, hh)
+  wrk <- lapply(seq_len(numworkers), function(l) {
+    load_worker_data_nullable(l, numworkers, hh, p_expected)
+  })
+  # Y
+  Y_full <- wrk[[1]]$yfdobj
+  # X per feature j: take from the owning worker
+  Xlist_full <- vector("list", p_expected)
+  for (j in seq_len(p_expected)) {
+    l_owner <- owner_of_feature(j, numworkers)
+    Xlist_full[[j]] <- wrk[[l_owner]]$predictorLst[[j]]
+    if (is.null(Xlist_full[[j]]))
+      stop(sprintf("[build_global_dataset_vfl] Feature %d missing at owner %d (k=%d, hh=%d)",
+                   j, l_owner, numworkers, hh))
+  }
+  # Split
   Xlist_train <- lapply(Xlist_full, subset_fd, idx = train_idx)
   Xlist_test  <- lapply(Xlist_full, subset_fd, idx = test_idx)
-  Y_train     <- subset_fd(Y_full, train_idx)
-  Y_test      <- subset_fd(Y_full, test_idx)
-  list(Xlist_train = Xlist_train, Xlist_test = Xlist_test,
-       Y_train = Y_train, Y_test = Y_test)
+  Y_train     <- subset_fd(Y_full,        idx = train_idx)
+  Y_test      <- subset_fd(Y_full,        idx = test_idx)
+  list(Xlist_train = Xlist_train, Xlist_test = Xlist_test, Y_train = Y_train, Y_test = Y_test)
 }
 
 metrics_fd <- function(yhat_fd, ytrue_fd, grid) {
@@ -87,7 +146,18 @@ metrics_fd <- function(yhat_fd, ytrue_fd, grid) {
   smape <- mean(2 * abs(Yhat - Ytru) / (abs(Yhat) + abs(Ytru) + eps)) * 100
   wmape <- sum(abs(Yhat - Ytru)) / (sum(abs(Ytru)) + eps) * 100
   mape  <- mean(abs(Yhat - Ytru) / (abs(Ytru) + eps)) * 100
-  list(rmse = rmse, nrmse = nrmse, smape = smape, wmape = wmape, mape = mape)
+  
+  # Functional L2 metrics using basis Gram My
+  My <- inprod(ytrue_fd$basis, ytrue_fd$basis)
+  C_hat  <- yhat_fd$coefs
+  C_true <- ytrue_fd$coefs
+  C_diff <- C_hat - C_true
+  il2  <- sum(colSums(C_diff * (My %*% C_diff))) / ncol(C_diff)
+  denom <- sum(colSums(C_true * (My %*% C_true))) / ncol(C_true)
+  ril2 <- il2 / (denom + eps)
+  
+  list(rmse = rmse, nrmse = nrmse, smape = smape, wmape = wmape, mape = mape,
+       il2 = il2, ril2 = ril2)
 }
 
 compute_sens_spec <- function(selected_idx, active_idx, p) {
@@ -98,21 +168,14 @@ compute_sens_spec <- function(selected_idx, active_idx, p) {
   c(sensitivity = sens, specificity = spec)
 }
 
-# Per-party communication (single release):
-# For party g with m_g predictors of Qx each:
-#   bytes_g ≈ (Ntrain * (m_g * Qx) + (m_g * Qx)^2) * 8
-comm_cost_mb_parties <- function(Ntrain, Qx, parties) {
-  bytes <- 0
-  for (g in seq_along(parties)) {
-    m_g <- length(parties[[g]])
-    qg  <- m_g * Qx
-    bytes <- bytes + (Ntrain * qg + qg * qg) * 8
-  }
+comm_cost_mb <- function(Ntrain, Qx, p) {
+  bytes <- p * (Ntrain * Qx + Qx * Qx) * 8
   bytes / (1024^2)
 }
 
-# Per-predictor clipping radii
-adapt_Sx <- function(Xlist_train) {
+adapt_Sx <- function(Xlist_train, mode = c("fixed", "empirical"), Sx_fixed = 3.0) {
+  mode <- match.arg(mode)
+  if (mode == "fixed") return(rep(Sx_fixed, length(Xlist_train)))
   Sx_vec <- numeric(length(Xlist_train))
   for (j in seq_along(Xlist_train)) {
     fdj <- Xlist_train[[j]]
@@ -125,22 +188,18 @@ adapt_Sx <- function(Xlist_train) {
   Sx_vec
 }
 
-# Scale per-predictor sx to keep total privacy roughly constant across J (optional)
-scale_sx_by_parties <- function(sx_base, parties, p, keep_total_privacy = FALSE) {
-  if (!keep_total_privacy) return(rep(sx_base, p))
-  rep(sx_base * sqrt(length(parties)), p)
-}
-
-# ---------------------- Job table ---------------------------
-load("truth_active_idx.RData")  # active_idx from generator
+# ---------------------- Job table ----------------------------
+set <- 1:N_global
+fold_size <- N_global / folds_per_worker
+stopifnot(fold_size == floor(fold_size))
 
 tasks <- expand.grid(
-  hh   = seq_len(num_duplicate),
-  Ji   = seq_along(parties_seq),
-  fold = seq_len(folds_per_worker),
+  hh     = seq_len(num_duplicate),
+  nw_i   = seq_along(numworkersseq),
+  fold   = seq_len(folds_per_worker),
   KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE
 )
-tasks$J <- parties_seq[tasks$Ji]
+tasks$numworkers <- numworkersseq[tasks$nw_i]
 
 # ---------------------- Parallel plan -----------------------
 n_cores_avail <- parallel::detectCores(logical = TRUE)
@@ -151,40 +210,34 @@ future::plan(multisession, workers = n_workers)
 results_list <- future_lapply(
   X = seq_len(nrow(tasks)),
   FUN = function(i_job) {
+    # Isolate job specs
     hh <- tasks$hh[i_job]
-    J  <- tasks$J[i_job]
+    numworkers <- tasks$numworkers[i_job]
     fold <- tasks$fold[i_job]
     
+    # Local session setup
     setwd(root_dir)
     suppressPackageStartupMessages({ library(fda) })
     source("functions.R")
-    load("truth_active_idx.RData")
+    load("truth_active_idx.RData")  # active_idx
     
-    # Load replicate (constant N)
-    rep_data <- load_replicate(hh)
-    Y_full <- rep_data$Y_full
-    Xlist_full <- rep_data$Xlist_full
+    # Reproducible seed per job
+    set.seed(10^6 * hh + 10^3 * numworkers + fold)
     
-    N_total <- ncol(Y_full$coefs)
-    stopifnot(all(vapply(Xlist_full, function(x) ncol(x$coefs), 1L) == N_total))
+    # Train/test indices (global; same individuals across workers)
+    test_idx  <- set[((fold - 1) * fold_size + 1):(fold * fold_size)]
+    train_idx <- setdiff(set, test_idx)
     
-    # Deterministic, balanced folds independent of J
-    folds <- split(1:N_total, rep_len(1:folds_per_worker, N_total))
-    test_base  <- folds[[fold]]
-    train_base <- setdiff(1:N_total, test_base)
-    
-    ds <- build_dataset_split(Xlist_full, Y_full, train_base, test_base)
+    # Build dataset (VFL semantics)
+    ds <- build_global_dataset_vfl(numworkers, hh, train_idx, test_idx)
     Xlist_train <- ds$Xlist_train
     Xlist_test  <- ds$Xlist_test
     Y_train     <- ds$Y_train
     Y_test      <- ds$Y_test
     
-    # Parties: split predictors vertically
-    parties <- assign_to_parties(p, J, mode = "roundrobin")
-    
-    # DP: per-predictor clipping radii and noise stds
-    Sx_vec <- adapt_Sx(Xlist_train)
-    sx_vec <- scale_sx_by_parties(sx_default, parties, p, keep_total_privacy)
+    # DP clipping & noise
+    Sx_vec <- adapt_Sx(Xlist_train, mode = Sx_mode, Sx_fixed = Sx_fixed)
+    sx_vec <- rep(sx_default, p)
     
     # Fit
     t0 <- Sys.time()
@@ -203,7 +256,8 @@ results_list <- future_lapply(
       df_K = df_K, patience = patience,
       sse_correct_dp = sse_correct_dp
     )
-    time_sec <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+    t1 <- Sys.time()
+    time_sec <- as.numeric(difftime(t1, t0, units = "secs"))
     
     # Predict & metrics
     yhat_test <- predict_vfl_dp_foboost(fit, Xlist_test)
@@ -212,37 +266,41 @@ results_list <- future_lapply(
     # Sensitivity/Specificity
     ss <- compute_sens_spec(fit$selected, active_idx, p)
     
-    # Communication cost (per party, single release)
-    Ntrain <- length(train_base)
-    comm_mb <- comm_cost_mb_parties(Ntrain, t_basis, parties)
+    # Communication cost (MB) for this fold/training size
+    Ntrain <- length(train_idx)
+    comm_mb <- comm_cost_mb(Ntrain, t_basis, p)
     
-    list(
-      hh = hh, fold = fold, J = J, Ji = which(parties_seq == J),
+    data.frame(
+      hh = hh, fold = fold, numworkers = numworkers, nw_i = which(numworkersseq == numworkers),
       WMAPE = metrics$wmape, SMAPE = metrics$smape, NRMSE = metrics$nrmse,
-      MAPE  = metrics$mape,  RMSE  = metrics$rmse,
+      MAPE  = metrics$mape, RMSE  = metrics$rmse,
+      IL2   = metrics$il2,  RIL2  = metrics$ril2,
       Sensitivity = ss["sensitivity"], Specificity = ss["specificity"],
-      Time_sec = time_sec, Comm_MB = comm_mb
+      Time_sec = time_sec, Comm_MB = comm_mb,
+      check.names = FALSE
     )
   },
   future.seed = TRUE
 )
 
 # ---------------------- Assemble results --------------------
-res_df <- do.call(rbind, lapply(results_list, function(x) as.data.frame(x, check.names = FALSE)))
+res_df <- do.call(rbind, results_list)
 
-K <- length(parties_seq)
+K <- length(numworkersseq)
 MAPE_arr  <- array(NA_real_, dim = c(K, num_duplicate, folds_per_worker))
 SMAPE_arr <- array(NA_real_, dim = c(K, num_duplicate, folds_per_worker))
 WMAPE_arr <- array(NA_real_, dim = c(K, num_duplicate, folds_per_worker))
 RMSE_arr  <- array(NA_real_, dim = c(K, num_duplicate, folds_per_worker))
 NRMSE_arr <- array(NA_real_, dim = c(K, num_duplicate, folds_per_worker))
+IL2_arr   <- array(NA_real_, dim = c(K, num_duplicate, folds_per_worker))
+RIL2_arr  <- array(NA_real_, dim = c(K, num_duplicate, folds_per_worker))
 Sens_arr  <- array(NA_real_, dim = c(K, num_duplicate, folds_per_worker))
 Spec_arr  <- array(NA_real_, dim = c(K, num_duplicate, folds_per_worker))
 Time_arr  <- array(NA_real_, dim = c(K, num_duplicate, folds_per_worker))
 Comm_arr  <- array(NA_real_, dim = c(K, num_duplicate, folds_per_worker))
 
 for (r in seq_len(nrow(res_df))) {
-  i  <- res_df$Ji[r]
+  i  <- res_df$nw_i[r]
   hh <- res_df$hh[r]
   f  <- res_df$fold[r]
   WMAPE_arr[i, hh, f] <- res_df$WMAPE[r]
@@ -250,6 +308,8 @@ for (r in seq_len(nrow(res_df))) {
   NRMSE_arr[i, hh, f] <- res_df$NRMSE[r]
   MAPE_arr[i, hh, f]  <- res_df$MAPE[r]
   RMSE_arr[i, hh, f]  <- res_df$RMSE[r]
+  IL2_arr[i, hh, f]   <- res_df$IL2[r]
+  RIL2_arr[i, hh, f]  <- res_df$RIL2[r]
   Sens_arr[i, hh, f]  <- res_df$Sensitivity[r]
   Spec_arr[i, hh, f]  <- res_df$Specificity[r]
   Time_arr[i, hh, f]  <- res_df$Time_sec[r]
@@ -257,13 +317,15 @@ for (r in seq_len(nrow(res_df))) {
 }
 
 res <- data.frame(
-  parties              = parties_seq,
+  workers              = numworkersseq,
   WMAPE_mean           = apply(WMAPE_arr, 1, mean, na.rm = TRUE),
   WMAPE_sd             = apply(WMAPE_arr, 1, sd,   na.rm = TRUE),
   WMAPE_worst          = apply(WMAPE_arr, 1, max,  na.rm = TRUE),
   sMAPE_mean           = apply(SMAPE_arr, 1, mean, na.rm = TRUE),
   NRMSE_mean           = apply(NRMSE_arr, 1, mean, na.rm = TRUE),
   MAPE_mean            = apply(MAPE_arr,  1, mean, na.rm = TRUE),
+  IL2_mean             = apply(IL2_arr,   1, mean, na.rm = TRUE),
+  RIL2_mean            = apply(RIL2_arr,  1, mean, na.rm = TRUE),
   Sensitivity_mean     = apply(Sens_arr,  1, mean, na.rm = TRUE),
   Specificity_mean     = apply(Spec_arr,  1, mean, na.rm = TRUE),
   Time_hours_mean      = apply(Time_arr,  1, mean, na.rm = TRUE) / 3600,
@@ -273,6 +335,7 @@ res <- data.frame(
 print(res)
 
 save(MAPE_arr, SMAPE_arr, WMAPE_arr, RMSE_arr, NRMSE_arr,
+     IL2_arr, RIL2_arr,
      Sens_arr, Spec_arr, Time_arr, Comm_arr, res, res_df,
      file = "vfl_dp_foboost_results.RData")
 
