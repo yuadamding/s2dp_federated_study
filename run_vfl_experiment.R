@@ -1,6 +1,6 @@
 # ============================================================
 # Parallel runner for DP-corrected VFL functional boosting
-# - Varies number of parties J (vertical split of predictors), constant N
+# - Varies number of parties J (vertical split), constant N
 # - Each (replicate x J x fold) is a parallel job
 # - DP-aware selection + CV early stopping
 # ============================================================
@@ -26,10 +26,8 @@ basisobj          <- create.bspline.basis(rangeval, nbasis = t_basis)
 tgrid             <- seq(rangeval[1], rangeval[2], by = 1)
 
 # DP hyperparameters
-sx_default <- 0.2         # base noise std per predictor (whitened mechanism)
-keep_total_privacy <- FALSE
-# If TRUE: scale noise ~ sqrt(J) within each party to keep total zCDP ~ constant across J
-# (approximate, assumes one mechanism per party; we still release per predictor)
+sx_default <- 0.2
+keep_total_privacy <- FALSE   # TRUE => scale per-predictor noise ~ sqrt(J)
 
 # FoF penalties / boosting controls
 lambda_s <- 5e-2
@@ -43,7 +41,7 @@ use_aic_c <- TRUE
 df_K <- 5
 patience <- 6
 min_steps <- 10
-sse_correct_dp <- FALSE   # not used in CV mode
+sse_correct_dp <- FALSE
 
 # ---------------------- Helpers -----------------------------
 
@@ -52,29 +50,24 @@ subset_fd <- function(fdobj, idx) {
   co <- fdobj$coefs
   if (is.matrix(co)) {
     fd(coef = co[, idx, drop = FALSE], basisobj = fdobj$basis, fdnames = fdobj$fdnames)
-  } else {
-    stop("3D fd$coefs not supported.")
-  }
+  } else stop("3D fd$coefs not supported.")
 }
 
 load_replicate <- function(hh) {
   load(sprintf("yfdobj_%d.RData", hh))        # yfdobj
   load(sprintf("predictorLst_%d.RData", hh))  # predictorLst (length p)
+  stopifnot(length(predictorLst) == p)
   list(Y_full = yfdobj, Xlist_full = predictorLst)
 }
 
 assign_to_parties <- function(p, J, mode = c("roundrobin", "contiguous")) {
   mode <- match.arg(mode)
-  if (mode == "roundrobin") {
-    split(1:p, ((0:(p-1)) %% J) + 1)
-  } else {
-    # contiguous blocks
+  if (mode == "roundrobin") split(1:p, ((0:(p-1)) %% J) + 1) else {
     cuts <- cut(1:p, breaks = J, labels = FALSE)
     split(1:p, cuts)
   }
 }
 
-# Build train/test subsets (same indices for all predictors)
 build_dataset_split <- function(Xlist_full, Y_full, train_idx, test_idx) {
   Xlist_train <- lapply(Xlist_full, subset_fd, idx = train_idx)
   Xlist_test  <- lapply(Xlist_full, subset_fd, idx = test_idx)
@@ -105,8 +98,8 @@ compute_sens_spec <- function(selected_idx, active_idx, p) {
   c(sensitivity = sens, specificity = spec)
 }
 
-# Communication cost if each party transmits its block once:
-#  For party g with m_g predictors of Qx basis each:
+# Per-party communication (single release):
+# For party g with m_g predictors of Qx each:
 #   bytes_g ≈ (Ntrain * (m_g * Qx) + (m_g * Qx)^2) * 8
 comm_cost_mb_parties <- function(Ntrain, Qx, parties) {
   bytes <- 0
@@ -133,14 +126,12 @@ adapt_Sx <- function(Xlist_train) {
 }
 
 # Scale per-predictor sx to keep total privacy roughly constant across J (optional)
-scale_sx_by_parties <- function(sx_base, parties, keep_total_privacy = FALSE) {
+scale_sx_by_parties <- function(sx_base, parties, p, keep_total_privacy = FALSE) {
   if (!keep_total_privacy) return(rep(sx_base, p))
-  # Approximation: if each party would use one Gaussian mechanism on its block,
-  # and we instead add noise per predictor, scale noise as ~ sqrt(J) to keep total zCDP ~ const.
   rep(sx_base * sqrt(length(parties)), p)
 }
 
-# ---------------------- Build job table ---------------------------
+# ---------------------- Job table ---------------------------
 load("truth_active_idx.RData")  # active_idx from generator
 
 tasks <- expand.grid(
@@ -151,12 +142,12 @@ tasks <- expand.grid(
 )
 tasks$J <- parties_seq[tasks$Ji]
 
-# ---------------------- Parallel plan ---------------------------
+# ---------------------- Parallel plan -----------------------
 n_cores_avail <- parallel::detectCores(logical = TRUE)
 n_workers <- max(1, min(n_cores_avail - 1, nrow(tasks)))
 future::plan(multisession, workers = n_workers)
 
-# ---------------------- Run all jobs in parallel ----------------
+# ---------------------- Run all jobs in parallel ------------
 results_list <- future_lapply(
   X = seq_len(nrow(tasks)),
   FUN = function(i_job) {
@@ -169,20 +160,18 @@ results_list <- future_lapply(
     source("functions.R")
     load("truth_active_idx.RData")
     
-    set.seed(10^6 * hh + 10^3 * J + fold)
-    
-    # Load the replicate (constant N)
+    # Load replicate (constant N)
     rep_data <- load_replicate(hh)
     Y_full <- rep_data$Y_full
     Xlist_full <- rep_data$Xlist_full
-    stopifnot(length(Xlist_full) == p)
     
     N_total <- ncol(Y_full$coefs)
-    # CV folds on base 1:N_total
-    fold_size <- floor(N_total / folds_per_worker)
-    idx_base  <- 1:N_total
-    test_base  <- idx_base[((fold - 1) * fold_size + 1) : (fold * fold_size)]
-    train_base <- setdiff(idx_base, test_base)
+    stopifnot(all(vapply(Xlist_full, function(x) ncol(x$coefs), 1L) == N_total))
+    
+    # Deterministic, balanced folds independent of J
+    folds <- split(1:N_total, rep_len(1:folds_per_worker, N_total))
+    test_base  <- folds[[fold]]
+    train_base <- setdiff(1:N_total, test_base)
     
     ds <- build_dataset_split(Xlist_full, Y_full, train_base, test_base)
     Xlist_train <- ds$Xlist_train
@@ -195,7 +184,7 @@ results_list <- future_lapply(
     
     # DP: per-predictor clipping radii and noise stds
     Sx_vec <- adapt_Sx(Xlist_train)
-    sx_vec <- scale_sx_by_parties(sx_default, parties, keep_total_privacy)
+    sx_vec <- scale_sx_by_parties(sx_default, parties, p, keep_total_privacy)
     
     # Fit
     t0 <- Sys.time()
@@ -214,8 +203,7 @@ results_list <- future_lapply(
       df_K = df_K, patience = patience,
       sse_correct_dp = sse_correct_dp
     )
-    t1 <- Sys.time()
-    time_sec <- as.numeric(difftime(t1, t0, units = "secs"))
+    time_sec <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
     
     # Predict & metrics
     yhat_test <- predict_vfl_dp_foboost(fit, Xlist_test)
@@ -231,7 +219,7 @@ results_list <- future_lapply(
     list(
       hh = hh, fold = fold, J = J, Ji = which(parties_seq == J),
       WMAPE = metrics$wmape, SMAPE = metrics$smape, NRMSE = metrics$nrmse,
-      MAPE  = metrics$mape, RMSE  = metrics$rmse,
+      MAPE  = metrics$mape,  RMSE  = metrics$rmse,
       Sensitivity = ss["sensitivity"], Specificity = ss["specificity"],
       Time_sec = time_sec, Comm_MB = comm_mb
     )
@@ -239,7 +227,7 @@ results_list <- future_lapply(
   future.seed = TRUE
 )
 
-# ---------------------- Assemble results ----------------------
+# ---------------------- Assemble results --------------------
 res_df <- do.call(rbind, lapply(results_list, function(x) as.data.frame(x, check.names = FALSE)))
 
 K <- length(parties_seq)

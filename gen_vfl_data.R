@@ -31,7 +31,7 @@ rangeval <- c(0, 100)
 Qx <- Qy <- 20
 basisobj <- create.bspline.basis(rangeval, nbasis = Qx)
 
-N_total        <- 1000   # <-- constant N across all party counts
+N_total        <- 1000   # <-- fixed N across all party counts
 num_duplicate  <- 20
 
 p <- 20
@@ -62,17 +62,17 @@ B_w_list <- lapply(1:p, make_Bw)
 for (hh in 1:num_duplicate) {
   message(sprintf("==== Replicate %d ====", hh))
   
-  # Draw whitened predictor coefficients Z_w_j ~ N(0, I)
+  # Whitened predictors Z_w_j ~ N(0, I)
   Z_w_list <- lapply(1:p, function(j) matrix(rnorm(Qx * N_total), Qx, N_total))
   
-  # Signal in whitened Y: Yw_signal = sum_j t(Bw_j) %*% Z_w_j
+  # Whitened signal in Y: Yw_signal = sum_j t(Bw_j) %*% Z_w_j
   Yw_signal <- matrix(0, Qy, N_total)
   for (j in 1:p) {
     Yw_signal <- Yw_signal + t(B_w_list[[j]]) %*% Z_w_list[[j]]
   }
   
-  # Choose noise level to match SNR_target
-  SigY <- stats::cov(t(Yw_signal))    # Qy x Qy
+  # Noise to match SNR_target (trace-based)
+  SigY <- stats::cov(t(Yw_signal))
   trSignal <- sum(diag(SigY))
   sigma_w <- sqrt(trSignal / (Qy * SNR_target + 1e-12))
   
@@ -80,7 +80,7 @@ for (hh in 1:num_duplicate) {
   Ew <- matrix(rnorm(Qy * N_total, sd = sigma_w), Qy, N_total)
   Yw <- Yw_signal + Ew
   
-  # Map whitened coefficients back to fd coefficient space:
+  # Map whitened coeffs back to fd coeff space:
   #   X: Cx = Mx^{-1/2} Z_w ;  Y: Cy = My^{-1/2} Yw
   predictorLst <- vector("list", p)
   for (j in 1:p) {

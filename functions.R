@@ -40,7 +40,7 @@ dp_release_coefficients <- function(C, M, S, s, ridge = 1e-8) {
   Q <- nrow(C); N <- ncol(C)
   M <- .symmetrize(M)
   Mhalf <- sym_eigen_sqrt(M, ridge)$half
-  # RKHS norms ||c||_M
+  # RKHS norms ||c||_M per column
   denom <- sqrt(colSums(C * (M %*% C)) + 1e-16)
   scales <- pmin(1, S / denom)
   Cclip <- C %*% diag(scales, nrow = N)
@@ -61,13 +61,13 @@ penalty_matrix <- function(basis, Lfdobj = int2Lfd(2)) {
 
 form_dp_moments <- function(Zdp, Ycoef, Sigma_x, s_y = 0, Sigma_y = NULL) {
   # Zdp: N x Qx   (post-DP, unwhitened)
-  # Ycoef: N x Qy (== response coefficients in the basis; equals "alpha" here)
+  # Ycoef: N x Qy (α in response basis)
   N <- nrow(Zdp)
   stopifnot(N >= 2, nrow(Ycoef) == N)
   cz <- center_rows(Zdp); Zc <- cz$Xc; zbar <- cz$mean
   cy <- center_rows(Ycoef); Yc <- cy$Xc; ybar <- cy$mean
-  Gxx_c <- crossprod(Zc) / N
-  Gxy_c <- crossprod(Zc, Yc) / N
+  Gxx_c <- crossprod(Zc) / N            # Qx x Qx
+  Gxy_c <- crossprod(Zc, Yc) / N        # Qx x Qy
   Gxx_bar <- (N/(N-1)) * Gxx_c - Sigma_x
   Gxy_bar <- (N/(N-1)) * Gxy_c
   list(Zc = Zc, zbar = zbar, Yc = Yc, ybar = ybar,
@@ -79,11 +79,12 @@ form_dp_moments <- function(Zdp, Ycoef, Sigma_x, s_y = 0, Sigma_y = NULL) {
 
 solve_penalized_fof <- function(Gxx_bar, Gxy_bar, Omega_x, Omega_y,
                                 lambda_s = 0, lambda_t = 0, lambda_st = 0,
-                                stabilize = list(alpha = 0, tau = NULL, ridge = 1e-8)) {
+                                stabilize = list(alpha = 0, tau = NULL, ridge = 1e-8, H_ridge = 1e-10)) {
   Qx <- nrow(Gxx_bar); Qy <- ncol(Gxy_bar)
   stopifnot(ncol(Gxx_bar) == Qx, nrow(Gxy_bar) == Qx,
             nrow(Omega_x) == Qx, ncol(Omega_x) == Qx,
             nrow(Omega_y) == Qy, ncol(Omega_y) == Qy)
+  
   A <- .symmetrize(Gxx_bar + lambda_s * Omega_x)
   alpha <- stabilize$alpha %||% 0
   tau   <- stabilize$tau
@@ -91,11 +92,24 @@ solve_penalized_fof <- function(Gxx_bar, Gxy_bar, Omega_x, Omega_y,
   if (is.null(tau)) tau <- sum(diag(Gxx_bar)) / max(1, Qx)
   if (alpha > 0) A <- (1 - alpha) * A + alpha * tau * diag(Qx)
   A <- .symmetrize(A + ridge * diag(Qx))
+  
   H <- kronecker(Diagonal(Qy), A)
   if (lambda_t != 0)  H <- H + lambda_t  * kronecker(Omega_y, Diagonal(Qx))
   if (lambda_st != 0) H <- H + lambda_st * kronecker(Omega_y, Omega_x)
+  H <- Matrix::forceSymmetric(H)
+  H <- H + (stabilize$H_ridge %||% 1e-10) * Diagonal(n = nrow(H))
+  
   d <- as.vector(Gxy_bar)
-  b <- solve(H, d, sparse = FALSE)
+  
+  # Prefer Cholesky (SPD). Fall back to generic solve on failure.
+  b <- try({
+    cholH <- Matrix::Cholesky(H, LDL = FALSE)
+    as.numeric(Matrix::solve(cholH, d))
+  }, silent = TRUE)
+  if (inherits(b, "try-error")) {
+    b <- as.numeric(Matrix::solve(H, d))
+  }
+  
   matrix(b, nrow = Qx, ncol = Qy)
 }
 
@@ -107,17 +121,18 @@ dp_fof_fit <- function(xfd, yfd,
                        Omega_x = NULL, Omega_y = NULL,
                        Lfd_x = int2Lfd(2), Lfd_y = int2Lfd(2),
                        lambda_s = 0, lambda_t = 0, lambda_st = 0,
-                       stabilize = list(alpha = 0.0, ridge = 1e-8)) {
+                       stabilize = list(alpha = 0.0, ridge = 1e-8, H_ridge = 1e-10)) {
   stopifnot(is.fd(xfd), is.fd(yfd))
   xbasis <- xfd$basis; ybasis <- yfd$basis
   Cx <- xfd$coefs; Cy <- yfd$coefs
   Qx <- nrow(Cx); Qy <- nrow(Cy); N <- ncol(Cx)
   stopifnot(ncol(Cy) == N)
   Mx <- inprod(xbasis, xbasis); My <- inprod(ybasis, ybasis)
+  
   dpX <- dp_release_coefficients(Cx, Mx, S = Sx, s = sx)
   Zdp <- t(dpX$Cdp)                 # N x Qx
   
-  # IMPORTANT: work in response coefficient space directly (alpha == coefficients)
+  # Response coefficients are α (coef matrix of yfd)
   Ycoef <- t(Cy)                    # N x Qy
   if (!is.null(Sy) && sy > 0) {
     dpY <- dp_release_coefficients(Cy, My, S = Sy, s = sy)
@@ -131,9 +146,8 @@ dp_fof_fit <- function(xfd, yfd,
   
   B <- solve_penalized_fof(mom$Gxx_bar, mom$Gxy_bar, Omega_x, Omega_y,
                            lambda_s, lambda_t, lambda_st,
-                           stabilize = list(alpha = stabilize$alpha %||% 0, ridge = stabilize$ridge %||% 1e-8))
+                           stabilize = stabilize)
   
-  # Predict in coefficient space
   Yhat_center <- mom$Zc %*% B
   Yhat_orig   <- sweep(Yhat_center, 2, mom$ybar, FUN = "+")
   yhat_fd <- fd(coef = t(Yhat_orig), basisobj = ybasis, fdnames = yfd$fdnames)
@@ -141,7 +155,7 @@ dp_fof_fit <- function(xfd, yfd,
   list(
     B = B,
     yhat_fd = yhat_fd,
-    centers = list(ybar = mom$ybar, zbar = mom$zbar),  # ybar is coef-mean
+    centers = list(ybar = mom$ybar, zbar = mom$zbar),
     Sigma_x = dpX$Sigma,
     Mx = Mx, My = My,
     Omega_x = Omega_x, Omega_y = Omega_y,
@@ -158,7 +172,7 @@ predict_dp_fof <- function(fit, xfd_new, center = TRUE) {
   if (center) Z_new <- sweep(Z_new, 2, fit$centers$zbar, FUN = "-")
   Yhat <- Z_new %*% fit$B
   if (center) Yhat <- sweep(Yhat, 2, fit$centers$ybar, FUN = "+")
-  fd(coef = t(Yhat), basisobj = fit$yhat_fd$basis, fdnames = xfd_new$fdnames)
+  fd(coef = t(Yhat), basisobj = fit$yhat_fd$basis, fdnames = fit$yhat_fd$fdnames)
 }
 
 # ---------- VFL DP boosting (Algorithm 2) -----------------------------------
@@ -188,7 +202,7 @@ estimate_df_hutchinson <- function(path, Z_list, Sigma_list, Omega_x_list, Omega
       dB <- solve_penalized_fof(Gxx_bar_list[[jj]], GxRj,
                                 Omega_x_list[[jj]], Omega_y,
                                 lambda_s, lambda_t, lambda_st,
-                                stabilize = list(alpha = 0.05, ridge = 1e-6))
+                                stabilize = list(alpha = 0.05, ridge = 1e-6, H_ridge = 1e-10))
       Bj <- Bj + dB
       F  <- F + Zj %*% dB
       Blist[[jj]] <- Bj
@@ -226,7 +240,7 @@ vfl_dp_foboost <- function(xfd_list, yfd,
   stopifnot(N >= 2)
   cY <- center_rows(Ycoef); Yc <- cY$Xc; ybar <- cY$mean
   
-  # -------- Per-party DP designs & Gxx_bar --------
+  # -------- Per-predictor DP designs & Gxx_bar --------
   Z_list <- vector("list", P)
   zbar_list <- vector("list", P)
   Sigma_list <- vector("list", P)
@@ -263,18 +277,18 @@ vfl_dp_foboost <- function(xfd_list, yfd,
   sse_trace <- numeric(0); aic_trace <- numeric(0); df_trace <- numeric(0)
   
   # -------- A/B split (used for selection AND CV stopping) --------
-  idx <- sample.int(N)
+  # Deterministic split to stabilize reproducibility
+  idx <- 1:N
   A <- idx[seq_len(floor(N/2))]
-  B <- setdiff(seq_len(N), A)
+  B <- setdiff(idx, A)
   
-  # CV validation accumulators: model trained on A, evaluated on B; and vice-versa
+  # CV validation accumulators
   Fhat_val_B <- matrix(0, length(B), Qy)   # predict B using increments fitted on A
   Fhat_val_A <- matrix(0, length(A), Qy)   # predict A using increments fitted on B
   best_val <- Inf
   best_state <- NULL
   no_improve <- 0
   
-  # Helper: compute AIC on TRAIN (optionally DP-corrected)
   compute_AIC_train <- function(SSE) {
     if (aic == "spherical") {
       df_hat <- estimate_df_hutchinson(selected, Z_list, Sigma_list,
@@ -292,7 +306,6 @@ vfl_dp_foboost <- function(xfd_list, yfd,
       Sres <- crossprod(Yc - Fhat) / N
       eps <- 1e-10
       val <- N * as.numeric(determinant(.symmetrize(Sres) + eps * diag(Qy), logarithm = TRUE)$modulus)
-      # add df penalty:
       df_hat <- estimate_df_hutchinson(selected, Z_list, Sigma_list,
                                        Omega_x_used, Omega_y, Gxx_bar_list,
                                        lambda_s, lambda_t, lambda_st,
@@ -311,7 +324,7 @@ vfl_dp_foboost <- function(xfd_list, yfd,
   for (m in seq_len(max_steps)) {
     R <- Yc - Fhat
     
-    # ---------- Per-party local solves ----------
+    # ---------- Per-predictor local solves ----------
     scores <- rep(NA_real_, P)
     dB_list <- vector("list", P)
     dBA_list <- vector("list", P)  # ΔB fitted on A
@@ -321,27 +334,27 @@ vfl_dp_foboost <- function(xfd_list, yfd,
       Zj <- Z_list[[j]]; Bj <- B_list[[j]]
       Omega_xj <- Omega_x_used[[j]]; Gxx_bar_j <- Gxx_bar_list[[j]]
       
-      # Full residual for training update:
+      # Full-data update (for training path)
       Rm_j <- R + Zj %*% Bj
       GxRj <- (N/(N-1)) * (crossprod(Zj, Rm_j) / N)
       dB <- solve_penalized_fof(Gxx_bar_j, GxRj, Omega_xj, Omega_y,
                                 lambda_s, lambda_t, lambda_st,
-                                stabilize = list(alpha = 0.05, ridge = 1e-6))
+                                stabilize = list(alpha = 0.05, ridge = 1e-6, H_ridge = 1e-10))
       dB_list[[j]] <- dB
       
-      # Two-fold updates used for selection & CV stopping
+      # Two-fold updates for selection & CV
       RmA_j <- R[A, , drop = FALSE] + Zj[A, , drop = FALSE] %*% Bj
       GxRjA <- ((length(A))/(length(A)-1)) * (crossprod(Zj[A, , drop = FALSE], RmA_j) / length(A))
       dBA <- solve_penalized_fof(Gxx_bar_j, GxRjA, Omega_xj, Omega_y,
                                  lambda_s, lambda_t, lambda_st,
-                                 stabilize = list(alpha = 0.05, ridge = 1e-6))
+                                 stabilize = list(alpha = 0.05, ridge = 1e-6, H_ridge = 1e-10))
       dBA_list[[j]] <- dBA
       
       RmB_j <- R[B, , drop = FALSE] + Zj[B, , drop = FALSE] %*% Bj
       GxRjB <- ((length(B))/(length(B)-1)) * (crossprod(Zj[B, , drop = FALSE], RmB_j) / length(B))
       dBB <- solve_penalized_fof(Gxx_bar_j, GxRjB, Omega_xj, Omega_y,
                                  lambda_s, lambda_t, lambda_st,
-                                 stabilize = list(alpha = 0.05, ridge = 1e-6))
+                                 stabilize = list(alpha = 0.05, ridge = 1e-6, H_ridge = 1e-10))
       dBB_list[[j]] <- dBB
       
       # DP-aware selection score (sum across folds)
@@ -354,7 +367,7 @@ vfl_dp_foboost <- function(xfd_list, yfd,
       scores[j] <- scoreAB + scoreBA
     }
     
-    # ---------- Choose best party and update ----------
+    # ---------- Choose predictor and update ----------
     j_star <- which.min(scores)
     selected <- c(selected, j_star)
     
@@ -363,17 +376,16 @@ vfl_dp_foboost <- function(xfd_list, yfd,
     B_list[[j_star]] <- B_list[[j_star]] + nu * dB
     Fhat <- Fhat + nu * (Z_list[[j_star]] %*% dB)
     
-    # CV validation accumulators:
-    #   use dBA (trained on A) to predict B; and dBB (trained on B) to predict A.
+    # CV accumulators
     Fhat_val_B <- Fhat_val_B + nu * (Z_list[[j_star]][B, , drop=FALSE] %*% dBA_list[[j_star]])
     Fhat_val_A <- Fhat_val_A + nu * (Z_list[[j_star]][A, , drop=FALSE] %*% dBB_list[[j_star]])
     
     # ---------- Stopping logic ----------
-    # Always log training SSE & (optionally) AIC on train for diagnostics
     SSE_train <- fro_sq(Yc - Fhat)
     sse_trace <- c(sse_trace, SSE_train)
     
     if (stop_mode == "aic_train" || stop_mode == "aic_train_dp") {
+      SSE_use <- SSE_train
       if (stop_mode == "aic_train_dp") {
         infl <- 0
         for (jj in seq_len(P)) {
@@ -381,15 +393,12 @@ vfl_dp_foboost <- function(xfd_list, yfd,
           infl <- infl + sum(diag(t(Bj) %*% Sigma_list[[jj]] %*% Bj))
         }
         SSE_use <- max(1e-12, SSE_train - (N - 1) * infl)
-      } else {
-        SSE_use <- SSE_train
       }
       AICm <- compute_AIC_train(SSE_use)
       aic_trace <- c(aic_trace, AICm)
-      
       val_metric <- AICm
       is_better <- (AICm + 1e-8 < best_val)
-    } else {  # stop_mode == "cv"
+    } else {  # "cv"
       SSE_val <- fro_sq(Yc[B, , drop=FALSE] - Fhat_val_B) +
         fro_sq(Yc[A, , drop=FALSE] - Fhat_val_A)
       val_metric <- SSE_val
@@ -431,7 +440,6 @@ vfl_dp_foboost <- function(xfd_list, yfd,
     stop_mode = stop_mode
   )
 }
-
 
 predict_vfl_dp_foboost <- function(fit, xfd_list_new) {
   P <- length(fit$B_list)
