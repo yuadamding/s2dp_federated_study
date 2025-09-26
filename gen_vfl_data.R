@@ -1,8 +1,9 @@
 # ============================================================
 # Stable VFL data generator (orthonormalized coefficients, controlled SNR)
-# Writes files:
-#   yfdobj_<l>_<k>_<hh>.RData
-#   predictorLst_<l>_<k>_<hh>.RData
+# Writes, for each replicate hh:
+#   yfdobj_<hh>.RData
+#   predictorLst_<hh>.RData
+# Also writes:
 #   truth_active_idx.RData
 # ============================================================
 
@@ -14,10 +15,14 @@ suppressPackageStartupMessages({
 
 # ---- helpers ----
 sym_eigen_sqrt <- function(M, ridge = 1e-10) {
-  ee <- eigen((M + t(M))/2, symmetric = TRUE)
-  lam <- pmax(ee$values, ridge); U <- ee$vectors
-  list(half = U %*% diag(sqrt(lam)) %*% t(U),
-       invhalf = U %*% diag(1/sqrt(lam)) %*% t(U))
+  M <- (M + t(M)) / 2
+  ee <- eigen(M, symmetric = TRUE)
+  lam <- pmax(ee$values, ridge)
+  U <- ee$vectors
+  list(
+    half    = U %*% diag(sqrt(lam), nrow = length(lam)) %*% t(U),
+    invhalf = U %*% diag(1 / sqrt(lam), nrow = length(lam)) %*% t(U)
+  )
 }
 
 # ---- settings ----
@@ -26,20 +31,20 @@ rangeval <- c(0, 100)
 Qx <- Qy <- 20
 basisobj <- create.bspline.basis(rangeval, nbasis = Qx)
 
-samplesPerWorker <- 100
-numworkersseq    <- c(2,4,6,8,10, 20, 50)
-num_duplicate    <- 20
+N_total        <- 1000   # <-- constant N across all party counts
+num_duplicate  <- 20
 
 p <- 20
-active_idx <- 1:5       # exact sparsity
+active_idx <- 1:5        # true sparse set
 rank_r <- 3
-a_active <- 1.0         # strength in whitened space
-SNR_target <- 10        # signal-to-noise ratio in whitened Y
+a_active <- 1.0          # operator magnitude (whitened)
+SNR_target <- 10         # signal-to-noise ratio in whitened Y
 
-# Precompute Gram matrices and square roots
+# Gram matrices and square roots
 Mx <- inprod(basisobj, basisobj)
 My <- inprod(basisobj, basisobj)
-MxS <- sym_eigen_sqrt(Mx); MyS <- sym_eigen_sqrt(My)
+MxS <- sym_eigen_sqrt(Mx)
+MyS <- sym_eigen_sqrt(My)
 
 # Build true B^(w)_j (whitened operators)
 set.seed(1001)
@@ -49,48 +54,45 @@ make_Bw <- function(j) {
   V <- qr.Q(qr(matrix(rnorm(Qy * rank_r), Qy, rank_r)))
   s <- a_active * c(1.0, 0.7, 0.4)
   Bw <- U %*% diag(s, nrow = rank_r) %*% t(V)
-  # Normalize to Frobenius ~ a_active (optional)
-  Bw / max(1e-12, norm(Bw, 'F')) * a_active * sqrt(rank_r)
+  Bw / max(1e-12, norm(Bw, "F")) * a_active * sqrt(rank_r)
 }
 B_w_list <- lapply(1:p, make_Bw)
 
 # ---- main loop ----
 for (hh in 1:num_duplicate) {
   message(sprintf("==== Replicate %d ====", hh))
-  for (k in numworkersseq) {
-    for (l in 1:k) {
-      # Draw whitened predictor coefficients Z_w_j ~ N(0, I)
-      Z_w_list <- lapply(1:p, function(j) matrix(rnorm(Qx * samplesPerWorker), Qx, samplesPerWorker))
-      
-      # Signal in whitened Y: Yw_signal = sum_j t(Bw_j) %*% Z_w_j
-      Yw_signal <- matrix(0, Qy, samplesPerWorker)
-      for (j in 1:p) {
-        Yw_signal <- Yw_signal + t(B_w_list[[j]]) %*% Z_w_list[[j]]
-      }
-      
-      # Choose noise level to match SNR_target (trace-based across Y dims)
-      SigY <- cov(t(Yw_signal))    # Qy x Qy
-      trSignal <- sum(diag(SigY))
-      sigma_w <- sqrt(trSignal / (Qy * SNR_target + 1e-12))
-      
-      # Add Gaussian noise in whitened space
-      Ew <- matrix(rnorm(Qy * samplesPerWorker, sd = sigma_w), Qy, samplesPerWorker)
-      Yw <- Yw_signal + Ew
-      
-      # Map whitened coefficients back to fd coefficient space
-      # X: c_x = Mx^{-1/2} Z_w ;  Y: c_y = My^{-1/2} Yw
-      predictorLst <- vector("list", p)
-      for (j in 1:p) {
-        Cx <- MxS$invhalf %*% Z_w_list[[j]]
-        predictorLst[[j]] <- fd(coef = Cx, basisobj = basisobj)
-      }
-      Cy <- MyS$invhalf %*% Yw
-      yfdobj <- fd(coef = Cy, basisobj = basisobj)
-      
-      save(yfdobj,      file = sprintf("yfdobj_%d_%d_%d.RData", l, k, hh))
-      save(predictorLst, file = sprintf("predictorLst_%d_%d_%d.RData", l, k, hh))
-    }
+  
+  # Draw whitened predictor coefficients Z_w_j ~ N(0, I)
+  Z_w_list <- lapply(1:p, function(j) matrix(rnorm(Qx * N_total), Qx, N_total))
+  
+  # Signal in whitened Y: Yw_signal = sum_j t(Bw_j) %*% Z_w_j
+  Yw_signal <- matrix(0, Qy, N_total)
+  for (j in 1:p) {
+    Yw_signal <- Yw_signal + t(B_w_list[[j]]) %*% Z_w_list[[j]]
   }
+  
+  # Choose noise level to match SNR_target
+  SigY <- stats::cov(t(Yw_signal))    # Qy x Qy
+  trSignal <- sum(diag(SigY))
+  sigma_w <- sqrt(trSignal / (Qy * SNR_target + 1e-12))
+  
+  # Add Gaussian noise in whitened space
+  Ew <- matrix(rnorm(Qy * N_total, sd = sigma_w), Qy, N_total)
+  Yw <- Yw_signal + Ew
+  
+  # Map whitened coefficients back to fd coefficient space:
+  #   X: Cx = Mx^{-1/2} Z_w ;  Y: Cy = My^{-1/2} Yw
+  predictorLst <- vector("list", p)
+  for (j in 1:p) {
+    Cx <- MxS$invhalf %*% Z_w_list[[j]]
+    predictorLst[[j]] <- fd(coef = Cx, basisobj = basisobj)
+  }
+  Cy <- MyS$invhalf %*% Yw
+  yfdobj <- fd(coef = Cy, basisobj = basisobj)
+  
+  save(yfdobj,       file = sprintf("yfdobj_%d.RData", hh))
+  save(predictorLst, file = sprintf("predictorLst_%d.RData", hh))
 }
+
 save(active_idx, file = "truth_active_idx.RData")
 message("Data generation complete.")
