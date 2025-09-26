@@ -192,18 +192,6 @@ source("run_vfl_experiment_parallel.R")
 
 ---
 
-## Common errors & fixes
-
-| Symptom                                                 | Likely cause                                                                                                             | Fix                                                                                                                                                                                                        |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Error: identical(length(predictorLst), p) is not TRUE` | Strict type check was using `identical()` (integer vs double).                                                           | Already fixed: compare with `==`. If you still see it, re‑source the updated `generator_vfl.R`.                                                                                                            |
-| `predictorLst[[j]] : subscript out of bounds`           | A previous generator wrote lists with missing slots (e.g., removing slots by assigning `NULL`).                          | The new generator **initializes a length‑`p` list** and never deletes slots. Delete old `predictorLst_*` files and regenerate.                                                                             |
-| `[load_worker_data] Length mismatch ... expected p=`    | Mismatch between `p` in runner and files created by an older generator run.                                              | Align `p` (and `N_global`, basis size) across generator & runner. Clean old files and regenerate.                                                                                                          |
-| `bad assignment: 'NA <- floor(N/2)'`                    | Reserving `NA` as a variable name in code (conflicts with the constant `NA`) — often detected when futures scan globals. | Not used in the shipped code; avoid `NA <-`. If you added such code, rename the variable.                                                                                                                  |
-| Accuracy changes with #workers                          | Runner used to cbind across workers (HFL).                                                                               | The current runner enforces **VFL** (feature‑ownership). With fixed `N_global`, accuracy should not systematically improve with more workers. If it does, you may be mixing old files; clean & regenerate. |
-
----
-
 ## Interpreting results
 
 The runner prints a one‑row summary per `k`:
