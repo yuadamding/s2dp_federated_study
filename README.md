@@ -229,6 +229,28 @@ Instead of per‑record DP on features, add Gaussian noise to the released **mom
 ---
 
 ## Minimal API cheatsheet
+## Interpreting results
+
+The runner prints a one‑row summary per `k`:
+
+* **WMAPE_mean / sMAPE_mean / MAPE_mean** — smaller is better.
+* **NRMSE_mean** — normalized RMSE; smaller is better.
+* **IL2_mean / RIL2_mean** — functional L2 errors in the basis metric; RIL2 is scale‑free.
+* **Sensitivity_mean / Specificity_mean** — feature selection quality against `active_idx`.
+* **Time_hours_mean** — average runtime per job.
+* **Comm_MB_mean** — approximate one‑time communication (MB) for DP coefficient releases.
+
+If you need **better WMAPE**, consider:
+
+* Reducing DP noise (smaller `sx_default`) or increasing clip `Sx_fixed` (if within privacy budget).
+* Larger `N_global` or higher `SNR_target` in the generator.
+* Tuning penalties (`lambda_s`, `lambda_t`) and shrinkage `nu`.
+* Allowing a longer path (`max_steps`) with modest `patience`.
+* Ensuring `Sx_mode="fixed"` for reproducible DP behavior (avoid dynamic clipping on heavy‑tailed draws).
+
+---
+
+## Minimal API reference (selected)
 
 ```r
 # Centralized DP FoF (optional path)
