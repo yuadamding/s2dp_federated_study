@@ -1,168 +1,197 @@
 # VFL–DP–FoF: Differentially‑Private Function‑on‑Function Regression in Vertical FL
 
-This repository contains an end‑to‑end R implementation of:
+This repository provides an end‑to‑end R implementation of:
 
-1. **Differentially private penalized function‑on‑function (FoF) regression** in coefficient space, and
-2. A **Vertical Federated Learning** (VFL) wrapper that performs **functional boosting** across parties with a **DP‑aware selection score** and **principled early stopping** (cross‑validated or AIC$_c$).
+1. **Differentially private (DP) penalized function‑on‑function (FoF) regression** in coefficient space, and
+2. A **Vertical Federated Learning (VFL)** wrapper that performs **functional boosting** across parties with a **DP‑aware selection score** and **principled early stopping** (cross‑validated or AIC_c).
 
-It includes a **stable data generator** (orthonormalized coefficients; controlled SNR), a **parallel runner** for experiments, and the **core FoF/boosting routines**.
+It includes a stable VFL **data generator** (orthonormalized coefficients; controlled SNR), a **parallel runner** for model evaluation, a **privacy sweep + black‑box membership‑inference attack (MIA)** to assess privacy risk vs. DP noise, and the **core FoF/boosting routines**.
 
 ---
 
-## Contents
+## Repository layout
 
 ```
 VFL_code/
-├─ generator_vfl.R                 # data generator (VFL semantics; fixed N across workers)
-├─ run_vfl_experiment_parallel.R   # parallel experiment runner
-├─ functions.R                     # DP FoF + VFL functional boosting implementation
-├─ vfl_dp_foboost_results.RData    # written by runner (results & arrays)
-├─ truth_active_idx.RData          # ground truth active predictors for evaluation
-├─ yfdobj_<l>_<k>_<hh>.RData       # response fd (identical across l for a fixed k,hh)
-└─ predictorLst_<l>_<k>_<hh>.RData # per-worker predictor list (length p; NULL for non‑owners)
+├─ generator_vfl.R                   # VFL data generator (fixed N across workers; feature ownership)
+├─ run_vfl_experiment_parallel.R     # Parallel experiment runner (utility metrics, selection metrics)
+├─ run_vfl_privacy_sweep.R           # Grid sweep over sx (DP noise) & workers; launches MIA; aggregates results
+├─ mia_blackbox.R                    # Black-box MIA (loss- and confidence-based) + zCDP ε accounting
+├─ functions.R                       # DP FoF + VFL functional boosting (DP moments + Sylvester updates)
+├─ vfl_dp_foboost_results.RData      # Written by the runner (arrays + summary; created after experiments)
+├─ truth_active_idx.RData            # Ground-truth active predictors (from generator)
+├─ yfdobj_<l>_<k>_<hh>.RData         # Response fd (identical across l for fixed k,hh)
+└─ predictorLst_<l>_<k>_<hh>.RData   # Per-worker predictor list (length p; NULL for non-owners)
+```
+
+---
+
+## Requirements
+
+* **R** ≥ 4.1
+* Packages: `fda`, `Matrix`, `future.apply`, `pROC` (for AUC), `stats` (base), `parallel` (base)
+
+Install from CRAN:
+
+```r
+install.packages(c("fda", "Matrix", "future.apply", "pROC"))
 ```
 
 ---
 
 ## Quick start
 
-> **R version**: 4.1+ recommended
-> **Packages**: `fda`, `Matrix`, `future.apply`
+### 1) Generate VFL data
 
 ```r
-install.packages(c("fda", "Matrix", "future.apply"))
-```
-
-1. **Generate data** (clears/overwrites matching files in the working directory):
-
-```r
-# in R
-setwd("/path/to/your/dir")
+setwd("/path/to/VFL_code")
 source("generator_vfl.R")
 ```
 
-This writes `yfdobj_*`, `predictorLst_*`, and `truth_active_idx.RData` for each replicate `hh` and worker count `k`.
+**What it writes**
 
-2. **Run experiments in parallel**:
+* `truth_active_idx.RData`
+* For each replicate `hh` and worker count `k`, and each worker `l ∈ {1,…,k}`:
+
+  * `yfdobj_<l>_<k>_<hh>.RData` — an `fd` object of Y **(identical across l)**
+  * `predictorLst_<l>_<k>_<hh>.RData` — **list of length p**; entry `j` is:
+
+    * an `fd` if worker `l` owns feature `j`,
+    * `NULL` otherwise.
+      Ownership is deterministic: `owner_of_feature(j, k) = ((j - 1) %% k) + 1`.
+
+> **Invariant:** Every `predictorLst_*` has `length(predictorLst) == p` and each slot is either `fd` (owned) or `NULL` (not owned).
+
+### 2) Run the parallel VFL experiment (utility & selection)
 
 ```r
-setwd("/path/to/your/dir")
+setwd("/path/to/VFL_code")
 source("run_vfl_experiment_parallel.R")
 ```
 
-This produces `vfl_dp_foboost_results.RData` with arrays and a per‑job data.frame (`res_df`), and prints a summary table.
+This launches parallel jobs over `(duplicate = hh) × (workers = k) × (fold)`, fits DP‑aware VFL boosting, and prints a summary table. It also writes:
+
+* `vfl_dp_foboost_results.RData` — arrays of metrics (WMAPE, sMAPE, MAPE, RMSE/NRMSE, functional IL2/RIL2, sensitivity/specificity, time, comm cost) and a long `res_df` with per‑job results.
+
+### 3) Sweep privacy noise and run black‑box MIA (privacy–utility analysis)
+
+```r
+setwd("/path/to/VFL_code")
+source("run_vfl_privacy_sweep.R")   # calls mia_blackbox.R internally
+```
+
+* Sweeps `sx` (Gaussian noise std in **whitened coefficient space**) and `numworkers`.
+* Trains models, runs **loss‑based** and **confidence‑based** MIAs, and computes **zCDP → (ε, δ)** accounting for the one‑shot per‑record releases.
+* Prints an aggregated table like:
+
+```
+=== Black-box MIA (means) by workers × sx ===
+   numworkers   sx  AUC_LA ADV_LA TPR10_LA  AUC_CONF ADV_CONF TPR10_CONF  Eps_train Time_sec
+1           2 0.00  0.603  0.19     0.192     0.601    0.186     0.182        Inf     7.17
+...
+11          2 0.20  0.584  0.17     0.148     0.528    0.089     0.115      9644     5.24
+16          2 0.30  0.516  0.08     0.091     0.484    0.050     0.088      4429     5.01
+```
+
+**Interpretation (at a glance):**
+Higher `sx` ⇒ more noise ⇒ **lower** MIA AUC/ADV/TPR10 (better privacy), but **formal ε** from local per‑record releases can still be large unless clipping is tight or you switch to central‑DP on moments.
 
 ---
 
-## What the code does
+## Method ↔ code alignment (key points)
 
-### 1) VFL data generator (`generator_vfl.R`)
-
-* **VFL semantics**: The number of **individuals** (samples) is **fixed** (`N_global`) for all worker counts $k$. Increasing $k$ only repartitions **features** (predictors) across workers; all workers observe the same individuals.
-* **Orthonormalized coefficients**: Predictors $X^{(j)}$ and responses $Y$ are simulated in whitened coefficient space, then mapped back to `fd` coefficients using basis Gram matrices $M_x, M_y$ (Bsplines by default).
-* **Signal & noise**: A low‑rank operator $B_j$ is created for a small set of **active** predictors (default: `active_idx <- 1:5`); whitened noise is added to reach target SNR (`SNR_target`).
-* **Files written per $(l,k,hh)$**:
-
-  * `yfdobj_<l>_<k>_<hh>.RData`: an `fd` object with coefficients $Q_y \times N$. **Identical across $l$** for a fixed $(k,hh)$.
-  * `predictorLst_<l>_<k>_<hh>.RData`: a **length‑`p` list**. Entry `j` is:
-
-    * an `fd` with the coefficients of feature $j$ **if worker $l$ owns feature $j$**,
-    * `NULL` otherwise.
-* **Ownership**: `owner_of_feature(j, k) = ((j-1) %% k) + 1`. Each feature belongs to exactly one worker.
-
-> **Important invariant**: For **every** `predictorLst_<l>_<k>_<hh>.RData`,
-> `length(predictorLst) == p` and each `predictorLst[[j]]` is either `fd` (if owned by worker `l`) or `NULL` (if not owned).
-
-### 2) Parallel runner (`run_vfl_experiment_parallel.R`)
-
-* Builds a **job table** over `(duplicate = hh) × (workers = k) × (fold)` and runs each job in parallel via `future.apply` (multisession).
-* **VFL‑aware loading**:
-
-  * Picks **one** `yfdobj` (from worker 1) — identical across workers by construction.
-  * For each feature $j$, loads the **owning** worker’s `fd` object into the global `Xlist`.
-* Performs **DP‑aware functional boosting** via `vfl_dp_foboost()`:
-
-  * Per‑party **clipping** in RKHS (coefficient space) and **Gaussian noise** (covariance $s_x^2 M_x$).
-  * **DP moment corrections** for centered covariance and cross‑moments.
-  * At each boosting step, solves a **penalized FoF Sylvester** update for every candidate party, computes a **DP‑corrected selection score**, and updates the best party with shrinkage $\nu$.
-  * **Early stopping** by **two‑fold CV** on the train split (default). AIC/AIC$_c$ option is available.
-* **Metrics**:
-
-  * pointwise: RMSE, NRMSE, sMAPE, WMAPE, MAPE
-  * functional (basis‑aware): $\| \hat Y - Y \|^2_{L^2}$ averaged per curve (IL2) and its ratio to $\| Y \|^2_{L^2}$ (RIL2)
-  * selection: sensitivity (TPR on `active_idx`), specificity (TNR on inactives)
-  * runtime & approximate **communication cost** (MB)
-* Saves **arrays** over `(k, hh, fold)` and a **summary table** aggregated over all replicates & folds.
-
-### 3) Core DP FoF & boosting (`functions.R`)
-
-Public API (all used by the runner):
-
-* `dp_release_coefficients(C, M, S, s)`: per‑record clipping in metric induced by $M$ and addition of $\mathcal{N}(0, s^2 M)$ noise.
-* `form_dp_moments(Zdp, Ycoef, Sigma_x, ...)`: centered sample covariance/cross‑covariance with the finite‑sample DP corrections $\frac{N}{N-1}$ and subtraction of $ \Sigma_x$.
-* `penalty_matrix(basis, Lfd)`: roughness penalty $ \int (D^m \phi_i)(D^m \phi_j)$.
-* `solve_penalized_fof(Gxx, Gxy, Omega_x, Omega_y, lambda_s, lambda_t, lambda_st, ...)`: generalized Sylvester/Kronecker solve for $B$.
-* `vfl_dp_foboost(...)`: VFL boosting with per‑party DP designs, DP‑corrected selection, CV stopping (or AIC/AIC$_c$), and Hutchinson df estimator (for AIC paths).
-* `predict_vfl_dp_foboost(fit, Xlist_new)`: prediction on new `fd` lists.
+* **DP at the feature parties:** Per‑record **clipping** in the RKHS metric induced by the basis Gram matrix (M_x), then add Gaussian noise with covariance (s_x^2 M_x) to coefficient columns (equiv. to isotropic noise in whitened coords).
+* **Finite‑sample DP moment correction:** after centering by **noisy means**, correct covariance by (N/(N-1)) and subtract the known DP covariance (\Sigma_x = s_x^2 M_x).
+* **FoF update:** Solve a penalized generalized **Sylvester** system for each candidate party (j):
+  ((\overline\Gamma_{xx}^{dp,j} + \lambda_s \Omega_{xj})\Delta B_j + \Delta B_j(\lambda_t \Omega_y) + \lambda_{st},\Omega_{xj}\Delta B_j\Omega_y = \overline\Gamma_{xR_{-j}}^{dp,j}).
+* **Selection score (DP‑aware):** ( S_{\text{corr}}(j) = |Z_j \Delta B_j - R_{-j}|*F^2 - (N-1),\mathrm{tr}(\Delta B_j^\top \Sigma*{xj} \Delta B_j)).
+* **Stopping (default):** two‑fold **CV** on the train split; **AIC/AIC_c** also available with a Hutchinson df estimator.
+* **VFL semantics:** Same individuals across workers; each worker owns a subset of **features**. The runner **selects the owner’s `fd`** for each feature; it does **not** concatenate samples across workers (that would be HFL).
 
 ---
 
-## Configuration knobs (where to tune)
+## Configuration (where to tune)
 
-### Data generator (`generator_vfl.R`)
+### In `generator_vfl.R`
 
-* `N_global` — number of individuals (fixed across workers).
-* `p` — number of features/predictors.
-* `active_idx` — indices of truly active predictors (default: `1:5`).
-* `rank_r`, `a_active` — rank/strength of true operators $B_j$ (in whitened space).
-* `SNR_target` — response SNR in whitened coordinates.
-* `basisobj` — basis family and size (default: B‑splines, `nbasis=20`).
+* `N_global`: number of individuals (fixed across all `k`).
+* `p`: total number of predictors.
+* `active_idx`: indices of truly active features (default `1:5`).
+* `rank_r`, `a_active`: rank/strength of the true operators in whitened space.
+* `SNR_target`: response SNR in whitened space.
+* `basisobj`: basis family and size (Bsplines with `nbasis = 20` by default).
 
-### Runner (`run_vfl_experiment_parallel.R`)
+### In `run_vfl_experiment_parallel.R`
 
-* `numworkersseq` — vector of worker counts to evaluate.
-* `num_duplicate`, `folds_per_worker` — repetitions and CV folds (on the **fixed** `N_global`).
-* **DP**:
+* `numworkersseq`, `num_duplicate`, `folds_per_worker`.
+* **DP knobs**
 
-  * `Sx_mode` — `"empirical"` (simulation only; **not** DP‑accounted) or `"fixed"` (use `Sx_fixed`).
-  * `sx_default` — per‑record noise std in whitened space; for DP, calibrate to $(\varepsilon,\delta)$ or zCDP $\rho$.
-* **FoF penalties & boosting**:
+  * `Sx_mode`: `"fixed"` (**DP‑accounted**) or `"empirical"` (**simulation‑only**; convenience).
+  * `Sx_fixed`: fixed clipping radius (whitened‑norm bound mapped to coefficient metric).
+  * `sx_default`: per‑record Gaussian noise std in whitened space (calibrate to your ((\varepsilon,\delta)) or zCDP (\rho)).
+* **FoF / boosting knobs**
 
-  * `lambda_s`, `lambda_t`, `lambda_st` — penalties on predictor/response roughness and interaction.
-  * `nu` — shrinkage (e.g., `0.3`).
-  * `max_steps`, `min_steps`, `patience` — boosting path length and early‑stopping controls.
-  * `use_crossfit=TRUE`, `stop_mode="cv"` — two‑fold CV by default (AIC/AIC$_c$ also supported).
+  * `lambda_s`, `lambda_t`, `lambda_st`: penalties.
+  * `nu`: shrinkage (e.g., `0.3`).
+  * `max_steps`, `min_steps`, `patience`: path length & early stopping.
+  * `use_crossfit = TRUE`, `stop_mode = "cv"` (AIC/AIC_c is supported).
+
+### In `run_vfl_privacy_sweep.R` / `mia_blackbox.R`
+
+* `sx_grid`: vector of noise levels to sweep (e.g., `c(0, 0.1, 0.2, 0.3)`).
+* `workers_grid`: vector of worker counts to sweep.
+* `delta_priv`: the (\delta) used in ((\varepsilon,\delta)) conversion from zCDP.
+* Attack choices: **loss‑based** vs **confidence‑based**; both are computed.
 
 ---
 
-## File formats (RData)
+## Privacy accounting (zCDP → ε, δ)
 
-* **`yfdobj_<l>_<k>_<hh>.RData`**
-  Contains `yfdobj` (`fd`): coefficient matrix `Qy × N_global`.
+* Replace‑one adjacency; per‑record Gaussian mechanism in whitened coords with clipping at (S_x) (ℓ₂ sensitivity (2S_x)).
+* Per‑feature zCDP: (\rho_j = \frac{(2S_x)^2}{2 s_x^2} = \frac{2 S_x^2}{s_x^2}).
+* Composition over features: (\rho_{\text{total}} = \sum_{j=1}^p \rho_j).
+* Convert to ((\varepsilon,\delta)): (\varepsilon = \rho_{\text{total}} + 2\sqrt{\rho_{\text{total}}\log(1/\delta)}).
 
-* **`predictorLst_<l>_<k>_<hh>.RData`**
-  Contains `predictorLst` (list length `p`). Entry `j` is:
+**Helper (invert approx. to pick `sx`):**
 
-  * `fd` (`Qx × N_global`) *if* worker `l` owns feature `j`,
-  * `NULL` otherwise.
+```r
+# Solve for s_x given target epsilon, delta, p, Sx (replace-one adjacency)
+sx_for_epsilon <- function(eps, delta, p, Sx) {
+  # crude invert via uniroot on rho_total
+  f <- function(rho) rho + 2*sqrt(rho*log(1/delta)) - eps
+  rho_tot <- uniroot(f, c(1e-12, 1e12))$root
+  # rho_tot = sum_j 2 Sx^2 / s_x^2 = 2 p Sx^2 / s_x^2
+  sqrt( (2 * p * Sx^2) / rho_tot )
+}
+```
 
-* **`truth_active_idx.RData`**
-  Contains `active_idx` (integer vector), used for sensitivity/specificity.
+> **Note:** Local per‑record DP with many features can produce very **large** ε unless `Sx` is tight or `sx` is large. If you need small ε with good utility, consider **central‑DP on moments** (sensitivity (O(1/N))) as an alternative design.
 
-* **`vfl_dp_foboost_results.RData`**
-  Arrays of metrics over `(k, hh, fold)` and `res` summary table; also `res_df` (long data.frame per job).
+---
+
+## Outputs & how to read them
+
+* **Experiment runner** prints per‑`k` summary:
+
+  * **Utility**: WMAPE/sMAPE/MAPE, RMSE/NRMSE, functional IL2/RIL2 (basis‑aware).
+  * **Selection**: sensitivity (TPR on `active_idx`), specificity (TNR on inactives).
+  * **Systems**: time (hours), approximate one‑time **communication cost** (MB) for DP coefficient releases.
+* **Privacy sweep + MIA** prints per‑(`workers`, `sx`) aggregates:
+
+  * **AUC / ADV (= 2·AUC − 1) / TPR@10%FPR** for loss‑ and confidence‑based attacks (lower is better).
+  * **Eps_train** from zCDP accounting (∞ when `sx = 0`).
+
+**Typical pattern:** as `sx` increases, MIAs degrade toward random (AUC→0.5), but ε may still be large under local per‑record DP unless `Sx` is tight or feature‑wise composition is mitigated.
 
 ---
 
 ## Reproducibility
 
-* The generator sets seeds internally; the runner sets a **job‑specific seed** so parallel jobs are reproducible (`future.seed = TRUE`).
-* **Do not mix old and new files**: if you change `N_global`, `p`, basis size, or worker counts, **delete old `yfdobj_*` and `predictorLst_*` files** before regenerating.
-
-Example:
+* The generator and runner set deterministic seeds (`future.seed = TRUE` for parallel jobs).
+* If you change `N_global`, `p`, basis, or worker counts, **delete old data files** to avoid stale‑file mismatches:
 
 ```r
-setwd("/path/to/your/dir")
+setwd("/path/to/VFL_code")
 file.remove(list.files(pattern = "^(yfdobj|predictorLst)_.*\\.RData$"))
 source("generator_vfl.R")
 source("run_vfl_experiment_parallel.R")
@@ -170,115 +199,61 @@ source("run_vfl_experiment_parallel.R")
 
 ---
 
-## How VFL is enforced here (and how it differs from HFL)
+## Troubleshooting
 
-* **VFL**: Each worker owns a **subset of features** for the **same N individuals**.
-  In files: each `predictorLst_<l>_*` has length `p`, with **NULL** entries for all features not owned by worker `l`.
-  The runner builds the global design by **selecting** the owning worker’s `fd` for each feature $j$. **No column concatenation across workers**.
+* **`Length mismatch in predictorLst_*: length(predictorLst)!=p`**
+  You likely have stale files from a previous run with different `p`. **Delete** old `yfdobj_*` and `predictorLst_*` and regenerate.
 
-* **HFL** (not used here): Each worker owns **different individuals** (rows). You would `cbind` across workers. This is explicitly **not** what the runner does.
+* **`predictorLst[[j]] is NULL but worker should own feature j`**
+  Ownership is `((j-1) %% k) + 1`. Ensure `generator_vfl.R` wasn’t edited to change ownership silently; regenerate all files.
 
----
+* **`no rows to aggregate` in privacy sweep**
+  The sweep created no successful jobs (e.g., empty `sx_grid` or all jobs failed earlier). Check console for earlier errors, verify `sx_grid`, `workers_grid`, and that the generator has produced files for those `k, hh`.
 
-## Differential Privacy notes (what is DP vs simulation‑only)
-
-* **DP mechanism** (inside `functions.R`):
-
-  * Per‑record clipping in RKHS (coefficient metric $M_x$): $c \mapsto c \cdot \min(1, S_x/\|c\|_{M_x})$.
-  * Add **Gaussian noise** with covariance $s_x^2 M_x$ to the **coefficients** (equivalent to isotropic noise in whitened coordinates).
-  * **Moment corrections** subtract the known DP covariance and apply the finite‑sample $\frac{N}{N-1}$ centering factor.
-* **Simulation‑only shortcut**: `Sx_mode = "empirical"` uses the empirical 95% quantile of per‑record norms as the clip radius (convenient for stability, **not** a DP guarantee).
-* **To claim DP**: set `Sx_mode = "fixed"` and pick `Sx_fixed`, then calibrate `sx_default` to your $(\varepsilon,\delta)$ (or zCDP $\rho$) using the **analytic Gaussian mechanism**, accounting for your adjacency notion and composition across parties.
+* **Windows parallel**
+  `future::plan(multisession)` is used (Windows‑safe). If you see stuck workers, try reducing `workers`, or set `plan(sequential)` to debug.
 
 ---
 
-## Common errors & fixes
+## Notes: VFL vs HFL
 
-| Symptom                                                 | Likely cause                                                                                                             | Fix                                                                                                                                                                                                        |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Error: identical(length(predictorLst), p) is not TRUE` | Strict type check was using `identical()` (integer vs double).                                                           | Already fixed: compare with `==`. If you still see it, re‑source the updated `generator_vfl.R`.                                                                                                            |
-| `predictorLst[[j]] : subscript out of bounds`           | A previous generator wrote lists with missing slots (e.g., removing slots by assigning `NULL`).                          | The new generator **initializes a length‑`p` list** and never deletes slots. Delete old `predictorLst_*` files and regenerate.                                                                             |
-| `[load_worker_data] Length mismatch ... expected p=`    | Mismatch between `p` in runner and files created by an older generator run.                                              | Align `p` (and `N_global`, basis size) across generator & runner. Clean old files and regenerate.                                                                                                          |
-| `bad assignment: 'NA <- floor(N/2)'`                    | Reserving `NA` as a variable name in code (conflicts with the constant `NA`) — often detected when futures scan globals. | Not used in the shipped code; avoid `NA <-`. If you added such code, rename the variable.                                                                                                                  |
-| Accuracy changes with #workers                          | Runner used to cbind across workers (HFL).                                                                               | The current runner enforces **VFL** (feature‑ownership). With fixed `N_global`, accuracy should not systematically improve with more workers. If it does, you may be mixing old files; clean & regenerate. |
+* **VFL (this repo):** same individuals across workers; workers own **disjoint feature subsets**.
+* **HFL:** workers own **disjoint subsets of individuals**. This code **does not** concatenate samples across workers (that would be HFL).
 
 ---
 
-## Interpreting results
+## Extending to central‑DP (optional)
 
-The runner prints a one‑row summary per `k`:
-
-* **WMAPE_mean / sMAPE_mean / MAPE_mean** — smaller is better.
-* **NRMSE_mean** — normalized RMSE; smaller is better.
-* **IL2_mean / RIL2_mean** — functional L2 errors in the basis metric; RIL2 is scale‑free.
-* **Sensitivity_mean / Specificity_mean** — feature selection quality against `active_idx`.
-* **Time_hours_mean** — average runtime per job.
-* **Comm_MB_mean** — approximate one‑time communication (MB) for DP coefficient releases.
-
-If you need **better WMAPE**, consider:
-
-* Reducing DP noise (smaller `sx_default`) or increasing clip `Sx_fixed` (if within privacy budget).
-* Larger `N_global` or higher `SNR_target` in the generator.
-* Tuning penalties (`lambda_s`, `lambda_t`) and shrinkage `nu`.
-* Allowing a longer path (`max_steps`) with modest `patience`.
-* Ensuring `Sx_mode="fixed"` for reproducible DP behavior (avoid dynamic clipping on heavy‑tailed draws).
+Instead of per‑record DP on features, add Gaussian noise to the released **moments** (\overline\Gamma_{xx}), (\overline\Gamma_{xy}). Sensitivity scales as (1/N) (with clipping in whitened space), enabling far smaller ε for comparable utility. The `functions.R` solver already works with noisy moments (post‑processing).
 
 ---
 
-## Minimal API reference (selected)
+## Minimal API cheatsheet
 
 ```r
-# Fit centralized DP FoF (optional path)
-fit <- dp_fof_fit(xfd, yfd, Sx, sx,
-                  Omega_x=NULL, Omega_y=NULL,
-                  lambda_s=0, lambda_t=0, lambda_st=0)
+# Centralized DP FoF (optional path)
+fit_c <- dp_fof_fit(xfd, yfd, Sx, sx, lambda_s=0.05, lambda_t=0.05)
 
-# Fit VFL boosting (used by runner)
-fit <- vfl_dp_foboost(xfd_list, yfd,
-                      Sx_vec, sx_vec,
-                      lambda_s, lambda_t, lambda_st,
-                      nu=0.3, max_steps=30,
-                      crossfit=TRUE, stop_mode="cv",
-                      min_steps=10, patience=6)
+# VFL DP boosting (main path)
+fit <- vfl_dp_foboost(
+  xfd_list, yfd, Sx_vec, sx_vec,
+  lambda_s=0.05, lambda_t=0.05, lambda_st=0,
+  nu=0.3, max_steps=30, crossfit=TRUE, stop_mode="cv",
+  min_steps=10, patience=6
+)
 
-# Predict (new X's must be fd lists with the same basis)
+# Predict on new data (same basis)
 yhat <- predict_vfl_dp_foboost(fit, xfd_list_new)
 ```
-
-**`fit`** contains:
-
-* `B_list`: per‑party FoF operator matrices in coefficient space
-* `selected`: selected party index at each step
-* `yhat_fd`: fitted responses on the training set (centered back to original mean)
-* `centers`: training means used for centering
-* `Sigma_list`, `Omega_x_list`, `Omega_y`
-* `traces`: SSE and AIC trajectories (if applicable)
-
----
-
-## Implementation details (method ↔ code alignment)
-
-* Clipping & Gaussian mechanism applied in **coefficient space** with covariance $s_x^2 M_x$.
-* **Centered moments** use noisy means (unbiased after subtracting $\Sigma_x$ and multiplying by $N/(N-1)$).
-* Penalized FoF: generalized **Sylvester** / **Kronecker** solve with roughness penalties.
-* Boosting: per‑party **local FoF update** on partial residuals; **noise‑corrected selection score** subtracts the expected DP inflation; **two‑fold cross‑fit** removes adaptive optimism and restores independence for scoring; early stopping via **CV** (default) or **AIC/AIC$_c$** with a Hutchinson df estimator.
-
----
-
-## Tips for extending / real‑data VFL
-
-* Replace the generator with your own `fd` objects per party; keep **length‑`p` lists** and `NULL` for non‑owners.
-* Ensure **all parties use the exact same basis** (range and `nbasis`) and share the same `N` individuals in the same order.
-* For DP deployments, set `Sx_mode="fixed"` and calibrate `sx_default` to your privacy budget; consider **fold‑wise** moment computation (cross‑fit) to strengthen independence assumptions behind selection scoring.
 
 ---
 
 ## License
 
-Research/academic use. If you need a formal license, add one here.
+Research/academic use. Add a formal license if needed.
 
 ---
 
 ## Acknowledgments
 
-Built on top of the `fda` package and standard linear‑algebra routines (`Matrix`). The method and notation follow the accompanying write‑up on DP‑corrected FoF regression and VFL functional boosting with principled stopping.
+Built on `fda`, `Matrix`, `future.apply`, and standard linear‑algebra routines. The implementation matches the accompanying write‑up on DP‑corrected FoF regression and VFL functional boosting with principled stopping.
