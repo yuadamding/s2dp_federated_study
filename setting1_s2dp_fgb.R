@@ -1,10 +1,10 @@
-# Accuracy vs Privacy Budget (whitened one-shot DP; per-party & global eps)
+# ---------------- Accuracy vs Privacy Budget (whitened one-shot DP; per-party & global eps)
 suppressPackageStartupMessages({
   library(fda)
   library(future.apply)
 })
 
-source("functions.R")  
+source("functions.R")  # uses the whitened one-shot DP implementation
 
 # ---------------------- Settings ----------------------------
 num_duplicate     <- 10
@@ -54,7 +54,8 @@ metrics_fd <- function(yhat_fd, ytrue_fd, grid) {
   list(wmape = wmape, smape = smape, nrmse = nrmse, mape = mape, rmse = rmse, il2 = il2, ril2 = ril2)
 }
 
-comm_cost_mb <- function(Ntrain, Qx, p) {           # one-shot, per party: Ntrain*Qx doubles
+# one-shot, per party: Ntrain*Qx doubles
+comm_cost_mb <- function(Ntrain, Qx, p) {
   bytes <- p * (Ntrain * Qx) * 8
   bytes / (1024^2)
 }
@@ -72,6 +73,27 @@ adapt_Sx <- function(Xlist, mode = c("fixed", "empirical"), Sx_fixed = 3.0) {
     if (!is.finite(Sx_vec[j]) || Sx_vec[j] <= 0) Sx_vec[j] <- 3.0
   }
   Sx_vec
+}
+
+# ---- NEW: classification helpers (train-calibrated threshold) ----
+score_fd_mean <- function(fdobj, grid) {
+  M <- eval.fd(grid, fdobj)  # |grid| x N
+  colMeans(M)
+}
+sens_spec_from_fd <- function(yhat_test_fd, y_test_fd, y_train_fd, grid) {
+  thr <- median(score_fd_mean(y_train_fd, grid), na.rm = TRUE)
+  s_true <- score_fd_mean(y_test_fd, grid)
+  s_pred <- score_fd_mean(yhat_test_fd, grid)
+  y_true <- as.integer(s_true >= thr)
+  y_pred <- as.integer(s_pred >= thr)
+  TP <- sum(y_pred == 1 & y_true == 1)
+  TN <- sum(y_pred == 0 & y_true == 0)
+  FP <- sum(y_pred == 1 & y_true == 0)
+  FN <- sum(y_pred == 0 & y_true == 1)
+  sens <- if ((TP + FN) > 0) TP / (TP + FN) else NA_real_
+  spec <- if ((TN + FP) > 0) TN / (TN + FP) else NA_real_
+  list(sensitivity = sens, specificity = spec, threshold = thr,
+       TP = TP, TN = TN, FP = FP, FN = FN)
 }
 
 # Build global dataset (no workers; one predictor per party)
@@ -93,7 +115,7 @@ build_global_dataset <- function(hh, train_idx, test_idx) {
 # zCDP epsilon per-party & global (no fold composition)
 eps_job_from_Sx <- function(Sx_vec, sx, delta, compose_over_cv = FALSE) {
   comp <- if (isTRUE(compose_over_cv)) 2L else 1L
-  adj  <- sqrt(comp)                     # ρ scales linearly; simple toggle
+  adj  <- sqrt(comp)                     # ρ scales linearly; simple toggle (kept for clarity)
   out  <- eps_from_sx_zcdp_vec(Sx_vec, sx, delta)
   list(
     eps_j      = out$eps_j,                # per-party epsilon (vector length p)
@@ -160,9 +182,12 @@ job_rows <- future_lapply(
     )
     time_sec <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
     
-    # Predict & metrics
+    # Predict & metrics (regression)
     yhat_test <- predict_vfl_dp_foboost(fit, X_test)
     mets <- metrics_fd(yhat_test, Y_test, grid = tgrid)
+    
+    # NEW: Sensitivity & Specificity (threshold from TRAIN)
+    cls <- sens_spec_from_fd(yhat_test, Y_test, Y_train, grid = tgrid)
     
     # Communication (one-shot)
     comm_mb <- comm_cost_mb(Ntrain = length(train_idx), Qx = t_basis, p = p)
@@ -173,6 +198,8 @@ job_rows <- future_lapply(
       WMAPE = mets$wmape, SMAPE = mets$smape, NRMSE = mets$nrmse,
       MAPE  = mets$mape,  RMSE  = mets$rmse,
       IL2   = mets$il2,   RIL2  = mets$ril2,
+      Sensitivity = cls$sensitivity,         # NEW
+      Specificity = cls$specificity,         # NEW
       Eps_global = eps_global,
       Time_sec = time_sec, Comm_MB = comm_mb,
       stringsAsFactors = FALSE, check.names = FALSE
@@ -198,9 +225,13 @@ if (nrow(sweep_df) == 0) {
   cat("\n[INFO] Wrote empty per-job CSV. No summary due to 0 rows.\n")
 } else {
   # Mean/sd by sx only (since parties are fixed and one per feature)
-  base_cols <- c("WMAPE","SMAPE","NRMSE","MAPE","RMSE","IL2","RIL2","Time_sec","Comm_MB","Eps_global")
-  agg_mean <- aggregate(sweep_df[, base_cols], by = list(sx = sweep_df$sx), FUN = function(x) mean(x, na.rm = TRUE))
-  agg_sd   <- aggregate(sweep_df[, base_cols], by = list(sx = sweep_df$sx), FUN = function(x) sd(x, na.rm = TRUE))
+  base_cols <- c("WMAPE","SMAPE","NRMSE","MAPE","RMSE","IL2","RIL2",
+                 "Sensitivity","Specificity",         # NEW
+                 "Time_sec","Comm_MB","Eps_global")
+  agg_mean <- aggregate(sweep_df[, base_cols], by = list(sx = sweep_df$sx),
+                        FUN = function(x) mean(x, na.rm = TRUE))
+  agg_sd   <- aggregate(sweep_df[, base_cols], by = list(sx = sweep_df$sx),
+                        FUN = function(x) sd(x, na.rm = TRUE))
   
   names(agg_mean)[-1] <- paste0(names(agg_mean)[-1], "_mean")
   names(agg_sd)[-1]   <- paste0(names(agg_sd)[-1],   "_sd")
