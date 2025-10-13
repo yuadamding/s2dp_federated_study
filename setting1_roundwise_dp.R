@@ -11,7 +11,7 @@ N_global <- 6250; folds <- 5; num_dup <- 20
 R_fixed  <- 10                    
 w_split  <- 0.5                   # fraction of zCDP budget to residual (rest to estimator)
 
-eps_grid    <- c(100, 80, 60, 40, 2, 10)
+eps_grid    <- c(100, 80, 60, 40, 20, 10)
 delta_total <- 1e-1
 
 lambda_s <- 5e-2; lambda_t <- 5e-2; lambda_st <- 0
