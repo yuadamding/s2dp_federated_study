@@ -1,58 +1,45 @@
-# ======= setting2_roundwise_dp.R (roundwise DP; ε-calibrated) =============
 suppressPackageStartupMessages({ library(fda); library(future.apply) })
 source("functions.R")
 source("functions_roundwise_dp.R")
 
-# --- settings --------------------------------------------------------------
-p <- 20; rangeval <- c(0,100); Q <- 20
+# ---------------- Settings -----------------------
+p <- 4; rangeval <- c(0, 100); Q <- 20
 basisobj <- create.bspline.basis(rangeval, nbasis = Q)
 tgrid <- seq(rangeval[1], rangeval[2], by = 1)
-N_global <- 500; folds <- 4; num_dup <- 20
 
-eps_grid <- c(Inf,1000, 500, 100, 80, 60, 40, 30, 20)
-delta_total <- 1e-5
+N_global <- 6250; folds <- 5; num_dup <- 20
+R_fixed  <- 10                    
+w_split  <- 0.5                   # fraction of zCDP budget to residual (rest to estimator)
+
+eps_grid    <- c(100, 80, 60, 40, 2, 10)
+delta_total <- 1e-1
 
 lambda_s <- 5e-2; lambda_t <- 5e-2; lambda_st <- 0
-nu <- 0.3; max_rounds <- 30; min_rounds <- 8; patience <- 6
+nu <- 0.1
 
-# --- helpers ---------------------------------------------------------------
+# ---------------- Helpers -----------------------
 subset_fd <- function(fdobj, idx) fd(coef = fdobj$coefs[, idx, drop=FALSE],
                                      basisobj = fdobj$basis, fdnames = fdobj$fdnames)
+
+# metrics (with worst-case NRMSE)
 metrics_fd <- function(yhat_fd, ytrue_fd, grid) {
-  Yhat <- eval.fd(grid, yhat_fd)   # |grid| x N
-  Ytru <- eval.fd(grid, ytrue_fd)  # |grid| x N
-  eps <- 1e-8
-  
-  # global RMSE (your existing one)
-  err  <- Yhat - Ytru
+  Yhat <- eval.fd(grid, yhat_fd); Ytru <- eval.fd(grid, ytrue_fd); eps <- 1e-8
+  err <- Yhat - Ytru
   rmse <- sqrt(mean(err^2))
-  
-  # per-subject RMSEs across the grid
   rmse_subj <- sqrt(colMeans(err^2))
-  
-  # same normalization as your current NRMSE (global sd of Y)
   denom_sd <- sd(as.numeric(Ytru)) + eps
-  nrmse        <- rmse / denom_sd
-  nrmse_worst  <- max(rmse_subj) / denom_sd
-  
-  # SMAPE / WMAPE / MAPE (unchanged)
+  nrmse <- rmse / denom_sd
+  nrmse_worst <- max(rmse_subj) / denom_sd
   smape <- mean(2 * abs(err) / (abs(Yhat) + abs(Ytru) + eps)) * 100
   wmape <- sum(abs(err)) / (sum(abs(Ytru)) + eps) * 100
   mape  <- mean(abs(err) / (abs(Ytru) + eps)) * 100
-  
-  # Functional IL2 & relative IL2 (unchanged)
   My <- inprod(ytrue_fd$basis, ytrue_fd$basis)
-  C_hat  <- yhat_fd$coefs; C_true <- ytrue_fd$coefs
-  C_diff <- C_hat - C_true
-  il2  <- sum(colSums(C_diff * (My %*% C_diff))) / ncol(C_diff)
+  C_hat <- yhat_fd$coefs; C_true <- ytrue_fd$coefs; C_diff <- C_hat - C_true
+  il2 <- sum(colSums(C_diff * (My %*% C_diff))) / ncol(C_diff)
   denom <- sum(colSums(C_true * (My %*% C_true))) / ncol(C_true)
   ril2 <- il2 / (denom + eps)
-  
-  list(
-    wmape = wmape, smape = smape,
-    nrmse = nrmse, nrmse_worst = nrmse_worst,
-    mape = mape, rmse = rmse, il2 = il2, ril2 = ril2
-  )
+  list(wmape=wmape, smape=smape, nrmse=nrmse, nrmse_worst=nrmse_worst,
+       mape=mape, rmse=rmse, il2=il2, ril2=ril2)
 }
 score_fd_mean <- function(fdobj, grid) colMeans(eval.fd(grid, fdobj))
 sens_spec_from_fd <- function(yhat_test_fd, y_test_fd, y_train_fd, grid) {
@@ -62,8 +49,7 @@ sens_spec_from_fd <- function(yhat_test_fd, y_test_fd, y_train_fd, grid) {
   TP <- sum(y_pred==1 & y_true==1); TN <- sum(y_pred==0 & y_true==0)
   FP <- sum(y_pred==1 & y_true==0); FN <- sum(y_pred==0 & y_true==1)
   list(sensitivity = if ((TP+FN)>0) TP/(TP+FN) else NA_real_,
-       specificity = if ((TN+FP)>0) TN/(TN+FP) else NA_real_, threshold = thr,
-       TP=TP,TN=TN,FP=FP,FN=FN)
+       specificity = if ((TN+FP)>0) TN/(TN+FP) else NA_real_)
 }
 sym_eigen_sqrt <- function(M, ridge=1e-8){
   ee <- eigen((M+t(M))/2, symmetric=TRUE)
@@ -79,7 +65,7 @@ empirical_Sres <- function(y_train_fd, q = 0.95){
   as.numeric(quantile(norms, q, na.rm = TRUE))
 }
 
-# --- jobs ------------------------------------------------------------------
+# ---------------- Jobs -----------------------
 set <- 1:N_global
 fold_size <- N_global / folds; stopifnot(fold_size == floor(fold_size))
 grid <- expand.grid(hh = seq_len(num_dup), fold = seq_len(folds),
@@ -109,16 +95,19 @@ rows <- future_lapply(seq_len(nrow(grid)), function(i) {
   X_train <- lapply(Xlist, subset_fd, idx = train_idx)
   X_test  <- lapply(Xlist, subset_fd, idx = test_idx)
   
-  # empirical S_res; S_est fixed (can be made empirical analogously)
-  S_res <- empirical_Sres(y_train, q = 0.95)
-  S_est <- 2.0
+  # empirical S_res; S_est fixed (or make empirical similarly)
+  # S_res <- empirical_Sres(y_train, q = 0.95)
+  # S_est <- 2.0
+  S_res <-  rep(3, p)
+  S_est <- 3
   
-  # calibrate noises for ε_target using M_max and 50/50 split
+  # calibrate per-round noises to hit target ε with EXACT R_fixed rounds
   if (is.finite(eps_t) && eps_t > 0) {
-    rho_t <- rho_from_eps(eps_t, delta_total)
-    rho_res <- 0.5 * rho_t; rho_est <- 0.5 * rho_t
-    s_res <- S_res * sqrt(2 * max_rounds / pmax(rho_res, 1e-12))
-    s_est <- S_est * sqrt(2 * max_rounds / pmax(rho_est, 1e-12))
+    rho_t   <- rho_from_eps(eps_t, delta_total)
+    rho_res <- w_split * rho_t
+    rho_est <- (1 - w_split) * rho_t
+    s_res <- S_res * sqrt(2 * R_fixed / pmax(rho_res, 1e-12))
+    s_est <- S_est * sqrt(2 * R_fixed / pmax(rho_est, 1e-12))
   } else { s_res <- 0; s_est <- 0 }
   
   t0 <- Sys.time()
@@ -128,32 +117,30 @@ rows <- future_lapply(seq_len(nrow(grid)), function(i) {
     S_est = S_est, s_est = s_est,
     Omega_x_list = NULL, Omega_y = NULL,
     lambda_s = lambda_s, lambda_t = lambda_t, lambda_st = lambda_st,
-    nu = nu, max_rounds = max_rounds, min_rounds = min_rounds, patience = patience,
+    nu = nu, R_fixed = R_fixed,
     use_crossfit = TRUE, delta_total = delta_total
   )
   time_sec <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
   
+  # predict & metrics
   yhat_test <- predict_roundwise_dp(fit, X_test)
   mets <- metrics_fd(yhat_test, y_test, grid = tgrid)
   cls  <- sens_spec_from_fd(yhat_test, y_test, y_train, grid = tgrid)
   
-  # communication per round
+  # communication per ROUND * R_fixed
   Ntr <- length(train_idx); Qx <- nrow(X_train[[1]]$coefs); Qy <- nrow(y_train$coefs)
-  comm_mb <- ( (p * Ntr * Qy) + (Qx * Qy) ) * 8 * fit$rounds / (1024^2)
+  comm_mb <- ( (p * Ntr * Qy) + (Qx * Qy) ) * 8 * R_fixed / (1024^2)
   
-  out <- data.frame(
-    hh = hh, fold = fold, eps_target = eps_t, rounds = fit$rounds,
-    WMAPE = mets$wmape, SMAPE = mets$smape, NRMSE = mets$nrmse,
+  data.frame(
+    hh = hh, fold = fold, eps_target = eps_t, rounds = R_fixed,
+    WMAPE = mets$wmape, SMAPE = mets$smape, NRMSE = mets$nrmse, NRMSE_worst = mets$nrmse_worst,
     MAPE = mets$mape,   RMSE  = mets$rmse,
     IL2 = mets$il2,     RIL2  = mets$ril2,
     Sensitivity = cls$sensitivity, Specificity = cls$specificity,
-    eps_global_realized = fit$eps$eps_global,
-    NRMSE_worst = mets$nrmse_worst,
+    Eps_global = eps_t,                 # <-- fixed, equals target
     Time_sec = time_sec, Comm_MB = comm_mb,
     stringsAsFactors = FALSE, check.names = FALSE
   )
-  for (j in seq_len(p)) out[[sprintf("Eps_p%d", j)]] <- fit$eps$eps_per_party[j]
-  out
 }, future.seed = TRUE)
 
 ok <- vapply(rows, function(x) is.data.frame(x) && nrow(x) == 1, logical(1))
@@ -162,8 +149,8 @@ res <- if (any(ok)) do.call(rbind, rows[ok]) else data.frame()
 if (nrow(res)) {
   write.csv(res, "roundwise_dp_perjob.csv", row.names = FALSE)
   
-  metrics <- c("WMAPE","SMAPE","NRMSE","MAPE","RMSE","IL2","RIL2",
-               "Sensitivity","Specificity","eps_global_realized","Time_sec","Comm_MB")
+  metrics <- c("WMAPE","SMAPE","NRMSE","NRMSE_worst","MAPE","RMSE","IL2","RIL2",
+               "Sensitivity","Specificity","Eps_global","Time_sec","Comm_MB")
   
   agg_mean <- aggregate(res[, metrics],
                         by = list(eps_target = res$eps_target),

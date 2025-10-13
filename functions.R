@@ -40,6 +40,30 @@ eps_from_sx_zcdp_vec <- function(Sx_vec, sx, delta){
        rho_total = sum(rho_j),
        eps_global = eps_from_rho(sum(rho_j), delta))
 }
+# ---- additive composition ------------------------------------------------------
+sigma_from_gaussian <- function(S, s) 2 * (S^2) / (s^2)
+
+prop3_sigma_one_shot <- function(Sx_vec, s_x) {
+  sum(sigma_from_gaussian(Sx_vec, s_x))
+}
+
+prop3_sigma_roundwise_fixed <- function(S_res, s_res, S_est, s_est, R_fixed) {
+  R_fixed * ( sigma_from_gaussian(S_res, s_res) + sigma_from_gaussian(S_est, s_est) )
+}
+
+eps_from_sigma <- function(sigma, delta) sigma + 2 * sqrt(pmax(sigma,0) * log(1/delta))
+
+# ----- Fold-aware noise calibration: split the target across releases -----
+# If CV makes each subject participate in (folds-1) training sets, then the
+# number of subject-level releases is m_cv = folds - 1. We calibrate each
+# *release* to spend sigma_target / m_cv so the total equals sigma_target.
+s_from_eps_one_shot_split <- function(Sx_vec, eps_target, delta, num_releases = 1L) {
+  if (!is.finite(eps_target) || eps_target <= 0) return(0)
+  sigma_target <- rho_from_eps(eps_target, delta)      # "σ" in Prop 3 (zCDP ρ)
+  sigma_each   <- sigma_target / max(1L, as.integer(num_releases))
+  K <- sum(2 * (Sx_vec^2))                             # sum_j 2 S_j^2
+  sqrt(K / pmax(sigma_each, 1e-12))                    # s_x for *each* release
+}
 
 # ---- DP release (whitened) -----------------------------------------------
 # Input coefficients C (Q x N), Gram M (Q x Q); clip radius S; noise s
