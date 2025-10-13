@@ -3,16 +3,16 @@ source("functions.R")
 source("functions_roundwise_dp.R")
 
 # ---------------- Settings -----------------------
-p <- 4; rangeval <- c(0, 100); Q <- 20
+p <- 5; rangeval <- c(0, 100); Q <- 5
 basisobj <- create.bspline.basis(rangeval, nbasis = Q)
 tgrid <- seq(rangeval[1], rangeval[2], by = 1)
 
-N_global <- 6250; folds <- 5; num_dup <- 20
+N_global <- 2500; folds <- 5; num_dup <- 20
 R_fixed  <- 10                    
 w_split  <- 0.5                   # fraction of zCDP budget to residual (rest to estimator)
 
 eps_grid    <- c(100, 80, 60, 40, 20, 10)
-delta_total <- 1e-1
+delta_total <- 1e-5
 
 lambda_s <- 5e-2; lambda_t <- 5e-2; lambda_st <- 0
 nu <- 0.1

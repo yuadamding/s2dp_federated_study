@@ -1,22 +1,22 @@
-# ======= setting1_s2dp_fgb.R (one-shot S2DP-FGB; ε-calibrated; Prop-3 fold split) =======
+# ======= setting1_s2dp_fgb.R  =======
 suppressPackageStartupMessages({ library(fda); library(future.apply) })
 source("functions.R")
 
 # --- settings --------------------------------------------------------------
 num_duplicate <- 20
 folds <- 5
-p <- 4
+p <- 5
 rangeval <- c(0, 100)
-t_basis <- 20
+t_basis <- 5
 basisobj <- create.bspline.basis(rangeval, nbasis = t_basis)
 tgrid <- seq(rangeval[1], rangeval[2], by = 1)
 
 # Sweep of total (final) privacy targets (ε, with δ below)
 eps_grid <- c(Inf, 100, 80, 60, 40, 20, 10)
-delta_total <- 1e-1
+delta_total <- 1e-5
 
 lambda_s <- 5e-2; lambda_t <- 5e-2; lambda_st <- 0
-nu <- 0.1; max_steps <- 10; patience <- 6; min_steps <- 5
+nu <- 0.1; max_steps <- 30; patience <- 6; min_steps <- 2
 
 # --- helpers ---------------------------------------------------------------
 subset_fd <- function(fdobj, idx) fd(coef = fdobj$coefs[, idx, drop = FALSE],
@@ -75,7 +75,6 @@ adapt_Sx_empirical <- function(Xlist, q = 0.95) {
 
 comm_cost_mb <- function(Ntrain, Qx, p) (p * (Ntrain * Qx) * 8) / (1024^2)
 
-# Prop-3 helpers (σ additivity) using functions from functions.R
 sigma_from_gaussian <- function(S, s) 2 * (S^2) / (s^2)
 prop3_sigma_one_shot <- function(Sx_vec, s_x) sum(sigma_from_gaussian(Sx_vec, s_x))
 eps_from_sigma <- function(sigma, delta) sigma + 2 * sqrt(pmax(sigma,0) * log(1/delta))
@@ -138,14 +137,14 @@ job_rows <- future_lapply(seq_len(nrow(tasks)), function(i_job) {
   Eps_prop3_total_implied <- if (is.finite(eps_t) && sx > 0)
     eps_from_sigma(Sigma_prop3_fold * m_cv, delta_total) else if (is.finite(eps_t)) Inf else 0
   
-  # --- fit (CV stopping) ---------------------------------------------------
+  # --- fit (AIC stopping) ---------------------------------------------------
   fit <- vfl_dp_foboost(
     xfd_list = X_train, yfd = Y_train,
     Sx_vec = Sx_vec, sx_vec = sx_vec,
     Omega_x_list = NULL, Omega_y = NULL,
     lambda_s = lambda_s, lambda_t = lambda_t, lambda_st = lambda_st,
     nu = nu, max_steps = max_steps, crossfit = TRUE,
-    stop_mode = "cv", min_steps = min_steps,
+    stop_mode = "aic_train_dp", min_steps = min_steps,
     aic = "spherical", aic_c = TRUE, df_K = 5, patience = patience
   )
   time_sec <- fit$timing$train_loop_time_s
@@ -164,7 +163,6 @@ job_rows <- future_lapply(seq_len(nrow(tasks)), function(i_job) {
     MAPE  = mets$mape,  RMSE = mets$rmse,
     IL2   = mets$il2,   RIL2 = mets$ril2,
     Sensitivity = cls$sensitivity, Specificity = cls$specificity,
-    # Prop-3 per-fold diagnostics:
     Sigma_prop3_fold = Sigma_prop3_fold,
     Eps_prop3_fold   = Eps_prop3_fold,
     Eps_prop3_total_implied = Eps_prop3_total_implied,
