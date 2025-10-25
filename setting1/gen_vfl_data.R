@@ -13,9 +13,9 @@ active_idx <- 1:2                # which predictors truly drive Y
 num_duplicate <- 20              # replicates to write
 
 # noise & ease controls (very easy)
-sigma_pred <- 0.005              # tiny predictor noise on the grid
-sigma_y    <- 0.005              # tiny response noise in coef space
-gain_active <- 1.0               # strength of each active predictor contribution
+sigma_pred <- 0.05              # tiny predictor noise on the grid
+sigma_y    <- 0.05              # tiny response noise in coef space
+gain_active <- 2.0               # strength of each active predictor contribution
 
 # ---------------- Helpers ----------------
 ############################################################################
@@ -123,6 +123,6 @@ for (hh in seq_len(num_duplicate)) {
   yfdobj <- yfdobj + fd(matrix(rnorm(t * n, sd = sigma_y), t, n), basisobj)
   
   # (4) Save in the current format expected by your new pipelines
-  save(yfdobj,        file = sprintf("yfdobj_%d.RData", hh))
-  save(predictorList, file = sprintf("predictorList_%d.RData", hh))
+  save(yfdobj,        file = sprintf("setting1/yfdobj_%d.RData", hh))
+  save(predictorList, file = sprintf("setting1/predictorList_%d.RData", hh))
 }

@@ -1,18 +1,17 @@
+# ======= setting2_roundwise_dp.R  =======
+# Fixed-round zCDP VFL boosting — adapted for Setting 2 data
+# Expects yfdobj_<hh>.RData and predictorList_<hh>.RData from the NeuroKit2 pipeline.
 suppressPackageStartupMessages({ library(fda); library(future.apply) })
 source("functions.R")
 source("functions_roundwise_dp.R")
 
 # ---------------- Settings -----------------------
-p <- 5; rangeval <- c(0, 100); Q <- 5
-basisobj <- create.bspline.basis(rangeval, nbasis = Q)
-tgrid <- seq(rangeval[1], rangeval[2], by = 1)
-
-N_global <- 2500; folds <- 5; num_dup <- 20
-R_fixed  <- 10                    
-w_split  <- 0.5                   # fraction of zCDP budget to residual (rest to estimator)
-
-eps_grid    <- c(100, 80, 60, 40, 20, 10)
+R_fixed  <- 10                    # exact number of boosting rounds
+w_split  <- 0.5                   # fraction of zCDP ρ to residual channel (rest to estimator)
+eps_grid <- c(100, 80, 60, 40, 20, 10)   # total ε targets
 delta_total <- 1e-5
+
+folds <- 5                        # CV folds
 
 lambda_s <- 5e-2; lambda_t <- 5e-2; lambda_st <- 0
 nu <- 0.1
@@ -21,7 +20,6 @@ nu <- 0.1
 subset_fd <- function(fdobj, idx) fd(coef = fdobj$coefs[, idx, drop=FALSE],
                                      basisobj = fdobj$basis, fdnames = fdobj$fdnames)
 
-# metrics (with worst-case NRMSE)
 metrics_fd <- function(yhat_fd, ytrue_fd, grid) {
   Yhat <- eval.fd(grid, yhat_fd); Ytru <- eval.fd(grid, ytrue_fd); eps <- 1e-8
   err <- Yhat - Ytru
@@ -57,18 +55,32 @@ sym_eigen_sqrt <- function(M, ridge=1e-8){
   list(half = U %*% diag(sqrt(lam), length(lam)) %*% t(U),
        invhalf = U %*% diag(1/sqrt(lam), length(lam)) %*% t(U))
 }
-empirical_Sres <- function(y_train_fd, q = 0.95){
+empirical_Sres <- function(y_train_fd, q = 0.90){
   My <- inprod(y_train_fd$basis, y_train_fd$basis)
   Y  <- t(y_train_fd$coefs); ybar <- colMeans(Y); Yc <- sweep(Y, 2, ybar, "-")
   Mys <- sym_eigen_sqrt(My); Uw <- Yc %*% t(Mys$invhalf)
   norms <- sqrt(rowSums(Uw * Uw))
   as.numeric(quantile(norms, q, na.rm = TRUE))
 }
+discover_replicates <- function() {
+  ys  <- list.files("setting2", pattern = "^yfdobj_(\\d+)\\.RData$", full.names = FALSE)
+  xs  <- list.files("setting2", pattern = "^predictorList_(\\d+)\\.RData$", full.names = FALSE)
+  idy <- as.integer(sub("^yfdobj_(\\d+)\\.RData$", "\\1", ys))
+  idx <- as.integer(sub("^predictorList_(\\d+)\\.RData$", "\\1", xs))
+  sort(intersect(idy, idx))
+}
+comm_cost_mb <- function(Ntrain, Qx, Qy, p, R) {
+  # residual broadcast: Ntrain x Qy (per party aggregation, but shared once)
+  # estimator update: Qx x Qy (selected party)
+  # crude upper bound per round: (p*Ntrain*Qy + Qx*Qy) * 8 bytes
+  ((p * Ntrain * Qy) + (Qx * Qy)) * 8 * R / (1024^2)
+}
 
 # ---------------- Jobs -----------------------
-set <- 1:N_global
-fold_size <- N_global / folds; stopifnot(fold_size == floor(fold_size))
-grid <- expand.grid(hh = seq_len(num_dup), fold = seq_len(folds),
+rep_ids <- discover_replicates()
+if (!length(rep_ids)) stop("No Setting 2 replicates found in working dir.")
+
+grid <- expand.grid(hh = rep_ids, fold = seq_len(folds),
                     eps_target = eps_grid, KEEP.OUT.ATTRS = FALSE)
 
 n_cores <- parallel::detectCores(TRUE)
@@ -80,13 +92,22 @@ rows <- future_lapply(seq_len(nrow(grid)), function(i) {
   
   # load replicate
   env <- new.env(parent = emptyenv())
-  load(sprintf("yfdobj_%d.RData", hh), envir = env)
-  load(sprintf("predictorList_%d.RData", hh), envir = env)
+  load(sprintf("setting2/yfdobj_%d.RData", hh), envir = env)
+  load(sprintf("setting2/predictorList_%d.RData", hh), envir = env)
   yfd <- get("yfdobj", env); Xlist <- get("predictorList", env)
   
-  # split
-  test_idx  <- set[((fold - 1) * fold_size + 1):(fold * fold_size)]
-  train_idx <- setdiff(set, test_idx)
+  # dims & grid from data
+  N_fd <- ncol(yfd$coefs)
+  Qx   <- nrow(Xlist[[1]]$coefs)
+  Qy   <- nrow(yfd$coefs)
+  p_job <- length(Xlist)
+  r  <- yfd$basis$rangeval
+  tgrid <- seq(r[1], r[2], length.out = 201)
+  
+  # deterministic fold split per replicate
+  fold_id  <- cut(seq_len(N_fd), breaks = folds, labels = FALSE, include.lowest = TRUE)
+  test_idx <- which(fold_id == fold)
+  train_idx <- which(fold_id != fold)
   
   subset_fd <- function(fdobj, idx) fd(coef = fdobj$coefs[, idx, drop=FALSE],
                                        basisobj = fdobj$basis, fdnames = fdobj$fdnames)
@@ -95,19 +116,18 @@ rows <- future_lapply(seq_len(nrow(grid)), function(i) {
   X_train <- lapply(Xlist, subset_fd, idx = train_idx)
   X_test  <- lapply(Xlist, subset_fd, idx = test_idx)
   
-  # empirical S_res; S_est fixed (or make empirical similarly)
-  # S_res <- empirical_Sres(y_train, q = 0.95)
-  # S_est <- 2.0
-  S_res <-  rep(3, p)
+  # empirical S_res (scalar); S_est fixed scalar
+  S_res <- empirical_Sres(y_train, q = 0.90)
+  if (!is.finite(S_res) || S_res <= 0) S_res <- 3
   S_est <- 3
   
-  # calibrate per-round noises to hit target ε with EXACT R_fixed rounds
+  # zCDP calibration per round (correct): ρ = Δ^2 / (2σ^2)
   if (is.finite(eps_t) && eps_t > 0) {
     rho_t   <- rho_from_eps(eps_t, delta_total)
     rho_res <- w_split * rho_t
     rho_est <- (1 - w_split) * rho_t
-    s_res <- S_res * sqrt(2 * R_fixed / pmax(rho_res, 1e-12))
-    s_est <- S_est * sqrt(2 * R_fixed / pmax(rho_est, 1e-12))
+    s_res <- S_res * sqrt(R_fixed / pmax(2 * rho_res, 1e-12))
+    s_est <- S_est * sqrt(R_fixed / pmax(2 * rho_est, 1e-12))
   } else { s_res <- 0; s_est <- 0 }
   
   t0 <- Sys.time()
@@ -128,8 +148,8 @@ rows <- future_lapply(seq_len(nrow(grid)), function(i) {
   cls  <- sens_spec_from_fd(yhat_test, y_test, y_train, grid = tgrid)
   
   # communication per ROUND * R_fixed
-  Ntr <- length(train_idx); Qx <- nrow(X_train[[1]]$coefs); Qy <- nrow(y_train$coefs)
-  comm_mb <- ( (p * Ntr * Qy) + (Qx * Qy) ) * 8 * R_fixed / (1024^2)
+  Ntr <- length(train_idx)
+  comm_mb <- comm_cost_mb(Ntr, Qx, Qy, p_job, R_fixed)
   
   data.frame(
     hh = hh, fold = fold, eps_target = eps_t, rounds = R_fixed,
@@ -137,7 +157,7 @@ rows <- future_lapply(seq_len(nrow(grid)), function(i) {
     MAPE = mets$mape,   RMSE  = mets$rmse,
     IL2 = mets$il2,     RIL2  = mets$ril2,
     Sensitivity = cls$sensitivity, Specificity = cls$specificity,
-    Eps_global = eps_t,                 # <-- fixed, equals target
+    Eps_global = eps_t,                 # equals target (fixed-round schedule)
     Time_sec = time_sec, Comm_MB = comm_mb,
     stringsAsFactors = FALSE, check.names = FALSE
   )
@@ -147,7 +167,7 @@ ok <- vapply(rows, function(x) is.data.frame(x) && nrow(x) == 1, logical(1))
 res <- if (any(ok)) do.call(rbind, rows[ok]) else data.frame()
 
 if (nrow(res)) {
-  write.csv(res, "roundwise_dp_perjob.csv", row.names = FALSE)
+  write.csv(res, "setting2_roundwise_dp_perjob.csv", row.names = FALSE)
   
   metrics <- c("WMAPE","SMAPE","NRMSE","NRMSE_worst","MAPE","RMSE","IL2","RIL2",
                "Sensitivity","Specificity","Eps_global","Time_sec","Comm_MB")
@@ -163,7 +183,7 @@ if (nrow(res)) {
   names(agg_sd)   <- c("eps_target", paste0(metrics, "_sd"))
   summary_df <- merge(agg_mean, agg_sd, by = "eps_target", all = TRUE)
   
-  write.csv(summary_df, "roundwise_dp_summary.csv", row.names = FALSE)
+  write.csv(summary_df, "setting2_roundwise_dp_summary.csv", row.names = FALSE)
   print(summary_df[order(summary_df$eps_target, decreasing = TRUE), ], row.names = FALSE)
 } else {
   cat("[WARN] No successful jobs.\n")
