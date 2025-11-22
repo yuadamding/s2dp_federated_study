@@ -23,6 +23,14 @@ P_pass <- if (length(dim(X_passive_arr)) == 3) dim(X_passive_arr)[3] else 0L
 P_act  <- if (length(dim(X_active_arr))  == 3) dim(X_active_arr)[3]  else 0L
 cat(sprintf("[INFO] Y: %d x %d | Passive: P=%d | Active: P=%d\n", T_obs, N_pat, P_pass, P_act))
 
+# -------------------- passive feature names (align with X_passive_arr order) --------------------
+# If produced by preprocessing, this file lists passive_keep in order.
+passive_all_names <- if (file.exists("passive_kept_names.txt")) {
+  readLines("passive_kept_names.txt")
+} else {
+  if (P_pass > 0) rep(NA_character_, P_pass) else character(0)
+}
+
 # -------------------- settings --------------------
 folds        <- 5
 eps_grid     <- c(Inf, 100, 80, 60, 40, 20, 10)  # total budget grid (global ε); Inf = no DP
@@ -77,6 +85,12 @@ metrics_fd <- function(yhat_fd, ytrue_fd, grid) {
        mape=mape, rmse=rmse, il2=il2, ril2=ril2)
 }
 sym_eigen_sqrt_local <- function(M, ridge=1e-8){
+  ee <- eigen((M+t(M))/2, symmetric=TRUE)
+  lam <- pmax(ee$values, ridge); U <- ee$vectors
+  list(half = U %>% diag(sqrt(lam), length(lam)) %*% t(U),
+       invhalf = U %*% diag(1/sqrt(lam), length(lam)) %*% t(U))
+}
+sym_eigen_sqrt_local <- function(M, ridge=1e-8){ # (safe, no pipe)
   ee <- eigen((M+t(M))/2, symmetric=TRUE)
   lam <- pmax(ee$values, ridge); U <- ee$vectors
   list(half = U %*% diag(sqrt(lam), length(lam)) %*% t(U),
@@ -187,10 +201,22 @@ job_rows <- future_lapply(seq_len(nrow(tasks)), function(i_job) {
   Sx_pass <- if (length(Xp_tr)) adapt_Sx_empirical_capped(Xp_tr, q = SCREEN_Q, cap_low = CLIP_CAP[1], cap_high = CLIP_CAP[2]) else numeric(0)
   
   # Passive TOPK screening; active always kept
-  keep_pass_idx <- if (length(Xp_tr) && TOPK > 0) dp_screen_topk_passive(Xp_tr, Y_tr, Sx_pass, eps_t, delta_total, TOPK) else seq_along(Xp_tr)
-  Xp_tr_kept <- if (length(keep_pass_idx)) Xp_tr[keep_pass_idx] else list()
-  Xp_te_kept <- if (length(keep_pass_idx)) Xp_te[keep_pass_idx] else list()
+  keep_pass_idx <- if (length(Xp_tr) && TOPK > 0)
+    dp_screen_topk_passive(Xp_tr, Y_tr, Sx_pass, eps_t, delta_total, TOPK)
+  else seq_along(Xp_tr)
+  
+  Xp_tr_kept   <- if (length(keep_pass_idx)) Xp_tr[keep_pass_idx] else list()
+  Xp_te_kept   <- if (length(keep_pass_idx)) Xp_te[keep_pass_idx] else list()
   Sx_pass_kept <- if (length(keep_pass_idx)) Sx_pass[keep_pass_idx] else numeric(0)
+  
+  # IDs/names of passive features kept for THIS job (align with passive_all_names / X_passive_arr)
+  p_pass_used_ids   <- if (length(keep_pass_idx)) paste(keep_pass_idx, collapse = ";") else ""
+  p_pass_used_names <- if (length(keep_pass_idx)) {
+    # guard length mismatch
+    names_use <- passive_all_names
+    if (length(names_use) < max(keep_pass_idx)) names_use <- c(names_use, rep(NA_character_, max(keep_pass_idx) - length(names_use)))
+    paste(names_use[keep_pass_idx], collapse = ";")
+  } else ""
   
   # Calibrate sx for ε on passive only
   if (is.finite(eps_t) && eps_t > 0 && length(Sx_pass_kept)) {
@@ -241,6 +267,8 @@ job_rows <- future_lapply(seq_len(nrow(tasks)), function(i_job) {
   data.frame(
     eps_target = eps_t, fold = fold,
     p_pass_used = P_pass_kept, p_act_used = P_act_all,
+    p_pass_used_ids = p_pass_used_ids,                 # NEW: indices of passive features used (screened-in)
+    p_pass_used_names = p_pass_used_names,             # NEW: names of passive features used
     WMAPE = mets$wmape, SMAPE = mets$smape,
     NRMSE = mets$nrmse, NRMSE_worst = mets$nrmse_worst,
     MAPE  = mets$mape,  RMSE = mets$rmse,
@@ -273,7 +301,7 @@ if (!nrow(sweep_df)) {
   names(agg_sd)[-1]   <- paste0(names(agg_sd)[-1],   "_sd")
   summary_df <- merge(agg_mean, agg_sd, by = "eps_target", all = TRUE)
   
-  write.csv(sweep_df,  out_perjob,  row.names = FALSE)
+  write.csv(sweep_df,  out_perjob,  row.names = FALSE)   # includes *ids* and *names*
   write.csv(summary_df, out_summary, row.names = FALSE)
   
   cat("\n=== CASE ARRAYS — (Passive DP, Active non-DP) Accuracy vs Privacy ===\n")
